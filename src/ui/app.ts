@@ -1,6 +1,8 @@
 import { BoxRenderable, KeyEvent, TextRenderable, createCliRenderer } from "@opentui/core";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { AiDriverLabel, AiModelProvider, GameAiLoop } from "../agent/ai.js";
+import { RoundPromptContext } from "../agent/prompt.js";
 import { CardType } from "../engine/cards.js";
 import {
   GameAction,
@@ -10,12 +12,11 @@ import {
   ResponseKind,
   ResponseOption,
   SanGuoGame,
-  SkillName,
 } from "../engine/game.js";
 
-type InputMode = "setup" | "action" | "target" | "response" | "gameover";
+type InputMode = "setup" | "action" | "target" | "response" | "discard" | "gameover";
 
-type SetupStage = "player-count" | "role" | "kingdom" | "general" | "start";
+type SetupStage = "player-count" | "role" | "kingdom" | "general" | "ai-model" | "ollama-model" | "start";
 
 type Kingdom = "魏" | "蜀" | "吴" | "群雄";
 
@@ -30,10 +31,11 @@ type TargetAction = Exclude<GameAction, { type: "end" }>;
 type PendingAiResponse = {
   actorId: string;
   action: GameAction;
-  targetId: string;
+  targetId?: string;
   responseKind: ResponseKind;
   cardName: string;
   options: ResponseOption[];
+  driverLabel: AiDriverLabel | "本地AI";
 };
 
 export class CliSanGuoApp {
@@ -73,11 +75,15 @@ export class CliSanGuoApp {
 
   private readonly rulesLines: string[];
 
+  private readonly aiLoop: GameAiLoop;
+
   private displayOverlayTitle: string | null;
 
   private displayOverlayLines: string[];
 
   private displayPage: number;
+
+  private displayFollowLatest: boolean;
 
   private actionPage: number;
 
@@ -93,9 +99,21 @@ export class CliSanGuoApp {
 
   private setupGeneralName: string;
 
+  private setupAiModel: AiModelProvider;
+
+  private setupOllamaModel: string;
+
+  private setupOllamaModels: string[];
+
+  private setupOllamaLoading: boolean;
+
+  private setupOllamaLoadError: string | null;
+
   private focusArea: FocusArea;
 
   private busy: boolean;
+
+  private roundBattlefieldHistory: Map<number, string[]>;
 
   constructor(game: SanGuoGame, options: AppOptions) {
     this.game = game;
@@ -109,9 +127,11 @@ export class CliSanGuoApp {
     this.commandBuffer = null;
     this.generalLibrary = this.game.getGeneralLibrary();
     this.rulesLines = this.loadRulesLines();
+    this.aiLoop = new GameAiLoop(this.rulesLines.join("\n"));
     this.displayOverlayTitle = null;
     this.displayOverlayLines = [];
     this.displayPage = 0;
+    this.displayFollowLatest = true;
     this.actionPage = 0;
     this.statusPage = 0;
     this.setupStage = "player-count";
@@ -119,8 +139,14 @@ export class CliSanGuoApp {
     this.setupRole = PlayerRole.Lord;
     this.setupKingdom = "吴";
     this.setupGeneralName = this.generalLibrary[0]?.name ?? "孙策";
+    this.setupAiModel = "qwen";
+    this.setupOllamaModel = "gemma4:latest";
+    this.setupOllamaModels = [];
+    this.setupOllamaLoading = false;
+    this.setupOllamaLoadError = null;
     this.focusArea = "display";
     this.busy = false;
+    this.roundBattlefieldHistory = new Map();
   }
 
   async start(): Promise<void> {
@@ -224,7 +250,7 @@ export class CliSanGuoApp {
       return;
     }
     if (this.mode === "setup") {
-      this.handleSetupInput(event);
+      void this.handleSetupInput(event);
       return;
     }
     if (this.mode === "response") {
@@ -233,6 +259,14 @@ export class CliSanGuoApp {
         return;
       }
       void this.handlePendingResponseChoice(pickedResponse);
+      return;
+    }
+    if (this.mode === "discard") {
+      const pickedDiscard = this.toOptionIndex(event);
+      if (pickedDiscard === null) {
+        return;
+      }
+      void this.handleDiscardChoice(pickedDiscard);
       return;
     }
     if (this.mode === "target" && event.name === "b") {
@@ -267,6 +301,11 @@ export class CliSanGuoApp {
     const current = this.game.getCurrentPlayer();
     if (action.type === "end") {
       await this.playAndAppendLogs(current.id, action);
+      if (this.game.getPendingDiscardCount(current.id) > 0) {
+        this.mode = "discard";
+        this.refresh();
+        return;
+      }
       await this.resolveAiTurns();
       return;
     }
@@ -294,21 +333,73 @@ export class CliSanGuoApp {
     await this.resolveAiTurns();
   }
 
+  private async handleDiscardChoice(picked: number): Promise<void> {
+    const current = this.game.getCurrentPlayer();
+    if (current.id !== "human") {
+      this.mode = "action";
+      this.refresh();
+      return;
+    }
+    const options = this.game.getDiscardOptions(current.id);
+    const selected = options[picked];
+    if (!selected) {
+      return;
+    }
+    this.busy = true;
+    try {
+      const logs = this.game.discardForCurrentPlayer(current.id, selected.handIndex);
+      for (const line of logs) {
+        this.logs.push(line);
+        this.refresh();
+        await this.delay(100);
+      }
+    } finally {
+      this.busy = false;
+    }
+    if (this.game.getPendingDiscardCount(current.id) > 0) {
+      this.mode = "discard";
+      this.refresh();
+      return;
+    }
+    await this.resolveAiTurns();
+  }
+
   private async resolveAiTurns(): Promise<void> {
     while (!this.game.getSnapshot().gameOver && this.game.getCurrentPlayer().isAI) {
       const ai = this.game.getCurrentPlayer();
-      const decision = this.game.getBestAiDecision(ai.id);
+      const snapshot = this.game.getSnapshot();
+      this.aiLoop.setPreviousRoundContexts(this.getPreviousRoundPromptContexts(snapshot.turn));
+      const modelDecision = await this.aiLoop.decide(this.game, ai.id);
+      const decision = modelDecision ?? this.game.getBestAiDecision(ai.id);
+      const driverLabel: AiDriverLabel | "本地AI" = modelDecision?.driverLabel ?? "本地AI";
+      const fallbackReason = !modelDecision ? this.aiLoop.getLastFailureReason() : null;
       if (!decision) {
         break;
       }
-      const response = this.buildPendingResponse(decision);
+      const targetText = decision.targetId ? ` -> ${this.labelPlayer(decision.targetId)}` : "";
+      const reasonText = fallbackReason ? `（回退原因：${fallbackReason}）` : "";
+      this.logs.push(`[${driverLabel}] ${ai.name} 选择：${decision.action.label}${targetText}${reasonText}`);
+      this.refresh();
+      await this.delay(200);
+      const response = this.buildPendingResponse(decision, driverLabel);
       if (response) {
+        if (response.targetId === "human" && response.options.length === 0) {
+          this.game.setPlayerResponsePolicy("human", { [response.responseKind]: false });
+          this.game.setPlayerResponseSelection("human", response.responseKind, null);
+          this.logs.push(`你没有可用于响应 ${response.cardName} 的手牌，自动继续结算`);
+          this.refresh();
+          await this.delay(120);
+          await this.playAndAppendLogs(ai.id, decision.action, decision.targetId, 200);
+          this.game.setPlayerResponseSelection("human", response.responseKind, null);
+          this.game.setPlayerResponsePolicy("human", null);
+          continue;
+        }
         this.pendingAiResponse = response;
         this.mode = "response";
         this.refresh();
         return;
       }
-      await this.playAndAppendLogs(ai.id, decision.action, decision.targetId);
+      await this.playAndAppendLogs(ai.id, decision.action, decision.targetId, 200);
     }
     this.mode = this.game.getSnapshot().gameOver ? "gameover" : "action";
     this.refresh();
@@ -323,6 +414,7 @@ export class CliSanGuoApp {
       return;
     }
     const snapshot = this.game.getSnapshot();
+    this.syncCurrentRoundBattlefield(snapshot);
     if (!snapshot.gameOver) {
       const current = this.game.getCurrentPlayer();
       this.actionOptions = current.isAI ? [] : this.game.getPlayableActions(current.id);
@@ -336,6 +428,8 @@ export class CliSanGuoApp {
     if (this.commandBuffer !== null) {
       actionLines.push(`命令模式: ${this.commandBuffer}`);
       actionLines.push("回车执行，退格删除，Esc 取消");
+      actionLines.push("可用命令:");
+      actionLines.push(...this.getCommandListLines());
     } else if (this.mode === "action") {
       this.actionOptions.forEach((action, index) => {
         actionLines.push(`${index + 1}. ${action.label}`);
@@ -353,9 +447,11 @@ export class CliSanGuoApp {
       actionLines.push("按 b 返回上一步");
     } else if (this.mode === "response") {
       const responseInfo = this.pendingAiResponse;
-      actionLines.push("你成为了指向型牌目标，请选择应对：");
+      actionLines.push("你受到牌效果影响，请选择应对：");
       if (responseInfo) {
-        actionLines.push(`来牌: ${responseInfo.cardName}（来自 ${this.labelPlayer(responseInfo.actorId)}）`);
+        actionLines.push(
+          `来牌: ${responseInfo.cardName}（来自 ${this.labelPlayer(responseInfo.actorId)}，决策来源 ${responseInfo.driverLabel}）`,
+        );
         if (responseInfo.options.length > 0) {
           responseInfo.options.forEach((option, index) => {
             actionLines.push(`${index + 1}. ${option.label}`);
@@ -366,6 +462,19 @@ export class CliSanGuoApp {
           actionLines.push("1. 继续结算（不应对）");
         }
       }
+    } else if (this.mode === "discard") {
+      const current = snapshot.players.find((player) => player.id === snapshot.currentPlayerId);
+      if (current && current.id === "human") {
+        const needDiscard = Math.max(0, current.hand.length - current.hp);
+        actionLines.push(
+          `弃牌阶段：需弃置 ${needDiscard} 张（手牌 ${current.hand.length} / 体力 ${Math.max(current.hp, 0)}）`,
+        );
+        current.hand.forEach((card, index) => {
+          actionLines.push(`${index + 1}. 弃置 ${card.type}`);
+        });
+      } else {
+        actionLines.push("等待回合推进...");
+      }
     } else {
       actionLines.push("按 r 重开，或输入 /exit 退出");
     }
@@ -375,6 +484,9 @@ export class CliSanGuoApp {
     const actionPageSize = this.getBodyPageSize("action");
     const statusPageSize = this.getBodyPageSize("status");
     const displayLines: string[] = this.buildDisplayLines();
+    if (this.displayOverlayTitle === null && this.displayFollowLatest) {
+      this.displayPage = this.getMaxPage(displayLines.length, displayPageSize);
+    }
     const displayViewLines = this.renderPagedArea({
       title: "显示区",
       lines: displayLines,
@@ -462,7 +574,53 @@ export class CliSanGuoApp {
     return statusLines;
   }
 
+  private toPromptBattlefieldLine(player: Player): string {
+    const equipments = `${player.weapon ?? "无"}/${player.armor ?? "无"}/${player.attackHorse ?? "无"}/${player.defenseHorse ?? "无"}/${player.treasure ?? "无"}`;
+    return `${player.name}(${player.id})|身份:${player.role}|武将:${player.general}|体力:${Math.max(player.hp, 0)}/${player.maxHp}|手牌:${player.hand.length}|装备:${equipments}|状态:${player.alive ? "存活" : "阵亡"}`;
+  }
+
+  private syncCurrentRoundBattlefield(snapshot: ReturnType<SanGuoGame["getSnapshot"]>): void {
+    const lines = snapshot.players.map((player) => this.toPromptBattlefieldLine(player));
+    this.roundBattlefieldHistory.set(snapshot.turn, lines);
+    if (this.roundBattlefieldHistory.size <= 20) {
+      return;
+    }
+    const rounds = Array.from(this.roundBattlefieldHistory.keys()).sort((a, b) => a - b);
+    const toDelete = rounds.slice(0, rounds.length - 20);
+    for (const round of toDelete) {
+      this.roundBattlefieldHistory.delete(round);
+    }
+  }
+
+  private getPreviousRoundPromptContexts(currentRound: number): RoundPromptContext[] {
+    const roundLogs = new Map<number, string[]>();
+    let activeRound: number | null = null;
+    for (const line of this.logs) {
+      const matched = line.match(/^第\s*(\d+)\s*(?:回合|轮)[:：]/);
+      if (matched?.[1]) {
+        activeRound = Number.parseInt(matched[1], 10);
+      }
+      if (activeRound === null || Number.isNaN(activeRound)) {
+        continue;
+      }
+      if (!roundLogs.has(activeRound)) {
+        roundLogs.set(activeRound, []);
+      }
+      roundLogs.get(activeRound)?.push(line);
+    }
+    const rounds = Array.from(roundLogs.keys())
+      .filter((round) => round < currentRound)
+      .sort((a, b) => a - b)
+      .slice(-3);
+    return rounds.map((round) => ({
+      round,
+      displayLines: roundLogs.get(round) ?? [],
+      battlefieldLines: this.roundBattlefieldHistory.get(round) ?? [],
+    }));
+  }
+
   private restart(): void {
+    this.aiLoop.stop();
     this.logs = [];
     this.pendingAction = null;
     this.commandBuffer = null;
@@ -470,6 +628,7 @@ export class CliSanGuoApp {
     this.targetOptions = [];
     this.actionOptions = [];
     this.displayPage = 0;
+    this.displayFollowLatest = true;
     this.actionPage = 0;
     this.statusPage = 0;
     this.initSetup();
@@ -576,104 +735,33 @@ export class CliSanGuoApp {
   private getHelpLines(): string[] {
     const lines: string[] = [];
     lines.push("=== 帮助 ===");
-    lines.push("【1）玩法】");
-    lines.push("- 开局先选人数、身份、武将，再进入对局。");
-    lines.push("- 出牌阶段可使用手牌或技能；需要目标时先选目标。");
-    lines.push("- 体力归 0 时会尝试用桃自救，否则阵亡。");
-    lines.push("- 身份胜利条件请参考 /rules。");
-    lines.push("【2）所有命令】");
-    lines.push("- /help 分页查看完整帮助");
+    lines.push("【命令】");
+    lines.push("- /help 查看帮助");
     lines.push("- /rules 查看完整规则文档");
+    lines.push("- /close 关闭当前文档");
     lines.push("- /exit 退出游戏");
-    lines.push("【3）卡牌功能说明】");
-    lines.push("- 杀：对1名其他角色造成1点伤害，可被闪抵消。");
-    lines.push("- 闪：仅用于响应杀，抵消伤害。");
-    lines.push("- 桃：回复1点体力。");
-    lines.push("- 过河拆桥：弃置1名其他角色的1张牌（手牌或装备）。");
-    lines.push("- 顺手牵羊：获得1名其他角色的1张牌（手牌或装备）。");
-    lines.push("- 决斗：与你指定目标轮流打出杀，先打不出者受1点伤害。");
-    lines.push("- 无中生有：立即摸2张牌。");
-    lines.push("- 南蛮入侵：其他角色各需打出1张杀，否则受1点伤害。");
-    lines.push("- 万箭齐发：其他角色各需打出1张闪，否则受1点伤害。");
-    lines.push("- 借刀杀人：指定1名角色，其需对他人出杀；若无法出杀，你获得其1张牌。");
-    lines.push("- 无懈可击：用于抵消以你为目标的锦囊效果（自动触发）。");
-    lines.push("- 桃园结义：所有存活角色各回复1点体力。");
-    lines.push("- 五谷丰登：所有存活角色各摸1张牌。");
-    lines.push("- 装备规则：武器/防具/宝物各限1件，+1马与-1马各限1件；新装备替换旧装备，旧装备直接弃置。");
-    lines.push("- 诸葛连弩（武器1）：出牌阶段使用杀无次数限制。");
-    lines.push("- 雌雄双股剑（武器2）：对异性角色使用杀时，其弃1手牌或你摸1牌。");
-    lines.push("- 青釭剑（武器2）：你的杀无视目标防具效果。");
-    lines.push("- 寒冰剑（武器2）：杀命中时可防止伤害，改为弃置目标2张牌。");
-    lines.push("- 古锭刀（武器2）：目标无手牌时，你的杀伤害+1。");
-    lines.push("- 丈八蛇矛（武器3）：可弃2张手牌当杀使用。");
-    lines.push("- 青龙偃月刀（武器3）：杀被闪后可再出1张杀继续追击。");
-    lines.push("- 贯石斧（武器3）：杀被闪后可弃2张牌令其强制命中。");
-    lines.push("- 方天画戟（武器4）：最后1张手牌为杀时可额外指定最多2名目标。");
-    lines.push("- 麒麟弓（武器5）：杀造成伤害后可弃置目标1匹马。");
-    lines.push("- 八卦阵（防具）：需要闪时判定红色视为打出闪。");
-    lines.push("- 仁王盾（防具）：黑色杀对你无效。");
-    lines.push("- 藤甲（防具）：普通杀/南蛮/万箭对你无效。");
-    lines.push("- 白银狮子（防具）：每次受到伤害至多为1；失去时回复1点体力。");
-    lines.push("- 的卢/绝影/爪黄飞电（+1马）：其他角色计算与你距离+1。");
-    lines.push("- 赤兔/大宛/紫骍（-1马）：你计算与其他角色距离-1。");
-    lines.push("- 木牛流马（宝物）：可置入1张手牌为“粮”，可移动给其他角色，可从下方使用这些牌。");
-    lines.push("【5）分页说明】");
-    lines.push("- 左右箭头：切换聚焦区（显示区/操作区/战场状态）。");
-    lines.push("- 上下箭头：对当前聚焦区翻页。");
-    lines.push("- 聚焦区会以绿色边框高亮显示。");
-    lines.push("- /help、/rules 会在显示区打开文档，输入 /close 关闭。");
-    lines.push("【4）武将介绍（含技能介绍）】");
-    for (const general of this.generalLibrary) {
-      const skillDesc = general.skills.length > 0 ? general.skills.map((skill) => this.describeSkill(skill)).join("；") : "无技能";
-      lines.push(`- ${general.name}：${skillDesc}`);
+    lines.push("【翻页】");
+    lines.push("- 左右箭头：切换聚焦区（显示区/操作区/战场状态）");
+    lines.push("- 上下箭头：对当前聚焦区翻页");
+    lines.push("- 聚焦区为绿色边框");
+    lines.push("");
+    const quickHelp = this.getRulesSection("16. 游戏内 /help 短版（可直接复用）");
+    if (quickHelp.length > 0) {
+      lines.push(...quickHelp);
+      return lines;
     }
+    lines.push("未在 rules.md 中找到“16. 游戏内 /help 短版（可直接复用）”章节。");
+    lines.push("可先使用 /rules 查看完整规则。");
     return lines;
   }
 
-  private describeSkill(skill: SkillName): string {
-    const skillDescMap: Record<SkillName, string> = {
-      [SkillName.Heroic]: "摸牌阶段额外摸1张",
-      [SkillName.Roar]: "出牌阶段使用杀无次数限制",
-      [SkillName.Assault]: "出牌阶段每回合一次，弃1牌对1名角色造成1伤害",
-      [SkillName.Guard]: "每回合首次受伤时，本次伤害-1",
-      [SkillName.JianXiong]: "受到伤害后可获益（当前实现为摸1张）",
-      [SkillName.HuJia]: "主公技，需要闪时可请求魏势力角色响应",
-      [SkillName.QingGuo]: "可将黑色手牌当闪使用或打出",
-      [SkillName.LuoShen]: "回合开始可连续判定黑色并获得判定牌",
-      [SkillName.GangLie]: "受伤后判定，令来源弃2手牌或受1点伤害",
-      [SkillName.LuoYi]: "摸牌阶段少摸1张，本回合杀/决斗伤害+1",
-      [SkillName.TuXi]: "摸牌阶段可改为从至多两名角色各获得1张手牌",
-      [SkillName.TianDu]: "你的判定牌生效后可获得之",
-      [SkillName.YiJi]: "每受1点伤害摸2并可分配给任意角色",
-      [SkillName.FanKui]: "受到伤害后可获得来源1张牌",
-      [SkillName.GuiCai]: "任意判定生效前可用手牌替换判定牌",
-      [SkillName.RenDe]: "出牌阶段可分配手牌给他人，累计给出2张可回血1",
-      [SkillName.JiJiang]: "主公技，需要杀时可请求蜀势力角色响应",
-      [SkillName.WuSheng]: "可将红色牌当杀使用或打出",
-      [SkillName.LongDan]: "可将杀当闪、闪当杀使用或打出",
-      [SkillName.MaShu]: "锁定技，你计算与其他角色距离-1",
-      [SkillName.TieQi]: "杀指定目标后可判定红色令其不能打闪",
-      [SkillName.GuanXing]: "回合开始可观看并调整牌堆顶若干牌顺序",
-      [SkillName.KongCheng]: "锁定技，无手牌时不能成为杀或决斗目标",
-      [SkillName.JiZhi]: "使用非延时锦囊时摸1张牌",
-      [SkillName.QiCai]: "使用锦囊无距离限制",
-      [SkillName.ZhiHeng]: "出牌阶段限一次，弃任意张并摸等量",
-      [SkillName.JiuYuan]: "主公技，其他吴势力桃救你时额外回复1",
-      [SkillName.FanJian]: "出牌阶段限一次，令目标猜花色并可能受伤",
-      [SkillName.KuRou]: "出牌阶段可失去1点体力并摸2张牌",
-      [SkillName.QianXun]: "锁定技，不能成为顺手牵羊和乐不思蜀目标",
-      [SkillName.LianYing]: "失去最后手牌时摸1张牌",
-      [SkillName.GuoSe]: "可将方片牌当乐不思蜀使用",
-      [SkillName.LiuLi]: "成为杀目标时可弃牌将杀转移",
-      [SkillName.JieYin]: "出牌阶段限一次，弃2手牌与你和1名男性角色各回复1",
-      [SkillName.XiaoJi]: "失去装备区里的牌时摸2张牌",
-      [SkillName.WuShuang]: "锁定技，你的杀需两闪抵消，决斗对方每次需两杀",
-      [SkillName.LiJian]: "出牌阶段限一次，令两名男性角色决斗",
-      [SkillName.BiYue]: "回合结束阶段摸1张牌",
-      [SkillName.QingNang]: "出牌阶段限一次，弃1手牌令1名角色回复1点体力",
-      [SkillName.JiJiu]: "濒死时可将红色手牌当桃使用",
-    };
-    return `${skill}（${skillDescMap[skill]}）`;
+  private getCommandListLines(): string[] {
+    return [
+      "- /help 查看帮助",
+      "- /rules 查看完整规则文档",
+      "- /close 关闭当前文档",
+      "- /exit 退出游戏",
+    ];
   }
 
   private loadRulesLines(): string[] {
@@ -686,18 +774,41 @@ export class CliSanGuoApp {
     }
   }
 
+  private getRulesSection(sectionTitle: string): string[] {
+    const heading = `## ${sectionTitle}`;
+    const start = this.rulesLines.findIndex((line) => line.trim() === heading);
+    if (start < 0) {
+      return [];
+    }
+    const lines: string[] = [];
+    for (let i = start; i < this.rulesLines.length; i += 1) {
+      const current = this.rulesLines[i] ?? "";
+      if (i > start && current.startsWith("## ")) {
+        break;
+      }
+      lines.push(current);
+    }
+    return lines;
+  }
+
   private initSetup(): void {
     const preferredCountSource = this.options.initOptions.playerCount ?? (this.options.initOptions.aiCount ?? 2) + 1;
     this.setupPlayerCount = Math.min(6, Math.max(2, Math.floor(preferredCountSource)));
     this.setupRole = PlayerRole.Lord;
     this.setupKingdom = "吴";
     this.setupGeneralName = this.getGeneralsByKingdom(this.setupKingdom)[0]?.name ?? (this.generalLibrary[0]?.name ?? "孙策");
+    this.setupAiModel = "qwen";
+    this.setupOllamaModel = "gemma4:latest";
+    this.setupOllamaModels = [];
+    this.setupOllamaLoading = false;
+    this.setupOllamaLoadError = null;
     this.setupStage = "player-count";
     this.mode = "setup";
     this.focusArea = "display";
     this.updateFocusFrame();
     this.closeDisplayOverlay();
     this.displayPage = 0;
+    this.displayFollowLatest = true;
     this.actionPage = 0;
     this.statusPage = 0;
   }
@@ -706,16 +817,23 @@ export class CliSanGuoApp {
     if (!this.battlefieldView || !this.actionView || !this.logsView) {
       return;
     }
+    const usingOllama = this.setupAiModel === "ollama";
     const stageTitle =
       this.setupStage === "player-count"
-        ? "步骤1/5：选择游玩人数"
+        ? "步骤1/6：选择游玩人数"
         : this.setupStage === "role"
-          ? "步骤2/5：选择身份"
+          ? "步骤2/6：选择身份"
           : this.setupStage === "kingdom"
-            ? "步骤3/5：选择势力"
+            ? "步骤3/6：选择势力"
           : this.setupStage === "general"
-            ? "步骤4/5：选择武将"
-            : "步骤5/5：开始游戏";
+              ? "步骤4/6：选择武将"
+              : this.setupStage === "ai-model"
+                ? "步骤5/6：选择默认AI模型"
+                : this.setupStage === "ollama-model"
+                  ? "步骤6/7：选择Ollama模型"
+                  : usingOllama
+                    ? "步骤7/7：开始游戏"
+                    : "步骤6/6：开始游戏";
     const leftLines: string[] = [];
     leftLines.push("输入“/”进入命令模式，建议先用 /help 查看帮助文档");
     leftLines.push("");
@@ -727,6 +845,10 @@ export class CliSanGuoApp {
     leftLines.push(`- 我的身份: ${this.setupRole}`);
     leftLines.push(`- 势力: ${this.setupKingdom}`);
     leftLines.push(`- 我的武将: ${this.setupGeneralName}`);
+    leftLines.push(`- 默认AI模型: ${this.getAiModelLabel(this.setupAiModel)}`);
+    if (this.setupAiModel === "ollama") {
+      leftLines.push(`- Ollama具体模型: ${this.setupOllamaModel}`);
+    }
     if (this.setupStage !== "player-count") {
       leftLines.push("");
       leftLines.push("按 b 返回上一步");
@@ -737,11 +859,16 @@ export class CliSanGuoApp {
     if (this.commandBuffer !== null) {
       actionLines.push(`命令模式: ${this.commandBuffer}`);
       actionLines.push("回车执行，退格删除，Esc 取消");
+      actionLines.push("可用命令:");
+      actionLines.push(...this.getCommandListLines());
     } else {
       const options = this.getSetupOptions();
       options.forEach((label, index) => {
         actionLines.push(`${index + 1}. ${label}`);
       });
+      if (this.setupStage === "ollama-model" && this.setupOllamaLoadError) {
+        actionLines.push(`读取失败：${this.setupOllamaLoadError}`);
+      }
       actionLines.push("输入 / 进入命令模式");
     }
 
@@ -780,7 +907,7 @@ export class CliSanGuoApp {
     this.logsView.content = statusViewLines.lines.join("\n");
   }
 
-  private handleSetupInput(event: KeyEvent): void {
+  private async handleSetupInput(event: KeyEvent): Promise<void> {
     if (this.setupStage !== "player-count" && event.name === "b") {
       if (this.setupStage === "role") {
         this.setupStage = "player-count";
@@ -788,8 +915,12 @@ export class CliSanGuoApp {
         this.setupStage = "role";
       } else if (this.setupStage === "general") {
         this.setupStage = "kingdom";
-      } else {
+      } else if (this.setupStage === "ai-model") {
         this.setupStage = "general";
+      } else if (this.setupStage === "ollama-model") {
+        this.setupStage = "ai-model";
+      } else {
+        this.setupStage = this.setupAiModel === "ollama" ? "ollama-model" : "ai-model";
       }
       this.refresh();
       return;
@@ -844,6 +975,45 @@ export class CliSanGuoApp {
         return;
       }
       this.setupGeneralName = pickedGeneral.name;
+      this.setupStage = "ai-model";
+      this.refresh();
+      return;
+    }
+    if (this.setupStage === "ai-model") {
+      const models = this.getAiModelOptions();
+      const model = models[picked];
+      if (!model) {
+        return;
+      }
+      this.setupAiModel = model;
+      if (model === "ollama") {
+        this.setupStage = "ollama-model";
+        this.refresh();
+        await this.loadOllamaModelsForSetup();
+        return;
+      }
+      this.setupStage = "start";
+      this.refresh();
+      return;
+    }
+    if (this.setupStage === "ollama-model") {
+      if (this.setupOllamaLoading) {
+        return;
+      }
+      const options = this.getSetupOptions();
+      const selected = options[picked];
+      if (!selected) {
+        return;
+      }
+      if (selected === "重新读取本地模型列表") {
+        await this.loadOllamaModelsForSetup();
+        return;
+      }
+      if (selected === "使用默认模型（gemma4:latest）") {
+        this.setupOllamaModel = "gemma4:latest";
+      } else {
+        this.setupOllamaModel = selected;
+      }
       this.setupStage = "start";
       this.refresh();
       return;
@@ -869,7 +1039,48 @@ export class CliSanGuoApp {
         return `${general.name}[${general.kingdom}] ${general.maxHp}体力（${skills}）`;
       });
     }
+    if (this.setupStage === "ai-model") {
+      return this.getAiModelOptions().map((model) => {
+        const desc = model === "ollama" ? "本地 Ollama 模型" : "云端 Qwen 模型";
+        return `${this.getAiModelLabel(model)}（${desc}）`;
+      });
+    }
+    if (this.setupStage === "ollama-model") {
+      if (this.setupOllamaLoading) {
+        return ["正在读取本地 Ollama 模型..."];
+      }
+      if (this.setupOllamaLoadError) {
+        return ["重新读取本地模型列表", "使用默认模型（gemma4:latest）"];
+      }
+      if (this.setupOllamaModels.length <= 0) {
+        return ["重新读取本地模型列表", "使用默认模型（gemma4:latest）"];
+      }
+      return this.setupOllamaModels;
+    }
     return ["开始游戏"];
+  }
+
+  private async loadOllamaModelsForSetup(): Promise<void> {
+    this.setupOllamaLoading = true;
+    this.setupOllamaLoadError = null;
+    this.refresh();
+    try {
+      const models = await this.aiLoop.getAvailableOllamaModels();
+      this.setupOllamaModels = models;
+      if (models.length > 0) {
+        this.setupOllamaModel = models[0] ?? this.setupOllamaModel;
+      }
+      if (models.length <= 0) {
+        this.setupOllamaLoadError = "未读取到可用模型";
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.setupOllamaLoadError = reason.replace(/\s+/g, " ").trim();
+      this.setupOllamaModels = [];
+    } finally {
+      this.setupOllamaLoading = false;
+      this.refresh();
+    }
   }
 
   private getPlayerCountOptions(): number[] {
@@ -894,6 +1105,14 @@ export class CliSanGuoApp {
     return this.generalLibrary.filter((general) => general.kingdom === kingdom);
   }
 
+  private getAiModelOptions(): AiModelProvider[] {
+    return ["ollama", "qwen"];
+  }
+
+  private getAiModelLabel(model: AiModelProvider): string {
+    return model === "ollama" ? "Ollama" : "Qwen";
+  }
+
   private getRoleDistributionText(playerCount: number): string {
     if (playerCount === 2) {
       return "反贼1 忠臣0 内奸0";
@@ -911,12 +1130,16 @@ export class CliSanGuoApp {
   }
 
   private startConfiguredGame(): void {
+    this.aiLoop.stop();
+    this.aiLoop.setPreferredProvider(this.setupAiModel);
+    this.aiLoop.setPreferredOllamaModel(this.setupAiModel === "ollama" ? this.setupOllamaModel : null);
     this.logs = [];
     this.pendingAction = null;
     this.pendingAiResponse = null;
     this.targetOptions = [];
     this.actionOptions = [];
     this.commandBuffer = null;
+    this.roundBattlefieldHistory.clear();
     this.closeDisplayOverlay();
     this.displayPage = 0;
     this.actionPage = 0;
@@ -930,19 +1153,36 @@ export class CliSanGuoApp {
         humanGeneral: this.setupGeneralName,
       }),
     );
+    const subAgentCount = this.aiLoop.start(this.game.getSnapshot());
+    const providerText =
+      this.setupAiModel === "ollama" ? `Ollama(${this.setupOllamaModel})` : this.getAiModelLabel(this.setupAiModel);
+    this.logs.push(`AI 决策环已启动，默认模型 ${providerText}，创建 ${subAgentCount} 个 subagent`);
+    void this.logAiLoopStatus();
     this.mode = "action";
     void this.resolveAiTurns();
     this.refresh();
   }
 
-  private async playAndAppendLogs(playerId: string, action: GameAction, targetId?: string): Promise<void> {
+  private async logAiLoopStatus(): Promise<void> {
+    const probe = await this.aiLoop.probe();
+    const detail = probe.detail.replace(/\s+/g, " ").trim().slice(0, 72);
+    if (probe.available) {
+      this.logs.push(`AI 驱动: ${probe.driverLabel} 已连接成功（${detail}）`);
+    } else {
+      this.logs.push(`AI 驱动: 使用本地AI（${probe.driverLabel} 不可用：${detail}）`);
+    }
+    this.refresh();
+  }
+
+  private async playAndAppendLogs(playerId: string, action: GameAction, targetId?: string, delayMs?: number): Promise<void> {
     this.busy = true;
     try {
       const logs = this.game.playAction(playerId, action, targetId);
+      const stepDelay = delayMs ?? (playerId === "human" ? 100 : 200);
       for (const line of logs) {
         this.logs.push(line);
         this.refresh();
-        await this.delay(100);
+        await this.delay(stepDelay);
       }
     } finally {
       this.busy = false;
@@ -980,14 +1220,17 @@ export class CliSanGuoApp {
     }
     this.pendingAiResponse = null;
     this.mode = "action";
-    await this.playAndAppendLogs(pending.actorId, pending.action, pending.targetId);
+    await this.playAndAppendLogs(pending.actorId, pending.action, pending.targetId, 200);
     this.game.setPlayerResponseSelection("human", pending.responseKind, null);
     this.game.setPlayerResponsePolicy("human", null);
     await this.resolveAiTurns();
   }
 
-  private buildPendingResponse(decision: { action: GameAction; targetId?: string }): PendingAiResponse | null {
-    if (decision.action.type !== "play" || !decision.targetId || decision.targetId !== "human") {
+  private buildPendingResponse(
+    decision: { action: GameAction; targetId?: string },
+    driverLabel: AiDriverLabel | "本地AI",
+  ): PendingAiResponse | null {
+    if (decision.action.type !== "play") {
       return null;
     }
     const actorId = this.game.getCurrentPlayer().id;
@@ -1002,37 +1245,88 @@ export class CliSanGuoApp {
     if (!cardName) {
       return null;
     }
+    const humanAlive = this.game.getSnapshot().players.some((player) => player.id === "human" && player.alive);
+    if (!humanAlive) {
+      return null;
+    }
+    const humanDirectTarget = decision.targetId === "human";
     if (cardName === CardType.Slash) {
+      if (!humanDirectTarget) {
+        return null;
+      }
       const options = this.game.getPlayerResponseOptions("human", "dodge");
+      const targetId = decision.targetId;
+      if (!targetId) {
+        return null;
+      }
       return {
         actorId: this.game.getCurrentPlayer().id,
         action: decision.action,
-        targetId: decision.targetId,
+        targetId,
         responseKind: "dodge",
         cardName,
         options,
+        driverLabel,
       };
     }
     if (cardName === CardType.Duel) {
+      if (!humanDirectTarget) {
+        return null;
+      }
+      const options = this.game.getPlayerResponseOptions("human", "slash");
+      const targetId = decision.targetId;
+      if (!targetId) {
+        return null;
+      }
+      return {
+        actorId,
+        action: decision.action,
+        targetId,
+        responseKind: "slash",
+        cardName,
+        options,
+        driverLabel,
+      };
+    }
+    if (cardName === CardType.Dismantle || cardName === CardType.Snatch || cardName === CardType.Collateral) {
+      if (!humanDirectTarget) {
+        return null;
+      }
+      const options = this.game.getPlayerResponseOptions("human", "negate");
+      const targetId = decision.targetId;
+      if (!targetId) {
+        return null;
+      }
+      return {
+        actorId,
+        action: decision.action,
+        targetId,
+        responseKind: "negate",
+        cardName,
+        options,
+        driverLabel,
+      };
+    }
+    if (cardName === CardType.Barbarian) {
       const options = this.game.getPlayerResponseOptions("human", "slash");
       return {
         actorId,
         action: decision.action,
-        targetId: decision.targetId,
         responseKind: "slash",
         cardName,
         options,
+        driverLabel,
       };
     }
-    if (cardName === CardType.Dismantle || cardName === CardType.Snatch || cardName === CardType.Collateral) {
-      const options = this.game.getPlayerResponseOptions("human", "negate");
+    if (cardName === CardType.ArrowRain) {
+      const options = this.game.getPlayerResponseOptions("human", "dodge");
       return {
         actorId,
         action: decision.action,
-        targetId: decision.targetId,
-        responseKind: "negate",
+        responseKind: "dodge",
         cardName,
         options,
+        driverLabel,
       };
     }
     return null;
@@ -1093,6 +1387,14 @@ export class CliSanGuoApp {
     return Math.max(6, pageSize);
   }
 
+  private getMaxPage(totalLines: number, pageSize: number): number {
+    if (pageSize <= 0) {
+      return 0;
+    }
+    const totalPages = Math.max(1, Math.ceil(totalLines / pageSize));
+    return totalPages - 1;
+  }
+
   private handleAreaPagingInput(event: KeyEvent): boolean {
     if (!event.name) {
       return false;
@@ -1108,11 +1410,19 @@ export class CliSanGuoApp {
       return true;
     }
     if (event.name === "up") {
+      if (this.focusArea !== "display") {
+        this.focusArea = "display";
+        this.updateFocusFrame();
+      }
       this.changeFocusedPage(-1);
       this.refresh();
       return true;
     }
     if (event.name === "down") {
+      if (this.focusArea !== "display") {
+        this.focusArea = "display";
+        this.updateFocusFrame();
+      }
       this.changeFocusedPage(1);
       this.refresh();
       return true;
@@ -1130,7 +1440,14 @@ export class CliSanGuoApp {
 
   private changeFocusedPage(step: -1 | 1): void {
     if (this.focusArea === "display") {
-      this.displayPage = Math.max(0, this.displayPage + step);
+      const displayLines = this.buildDisplayLines();
+      const displayPageSize = this.getBodyPageSize("display");
+      const maxPage = this.getMaxPage(displayLines.length, displayPageSize);
+      const nextPage = Math.min(Math.max(this.displayPage + step, 0), maxPage);
+      this.displayPage = nextPage;
+      if (this.displayOverlayTitle === null) {
+        this.displayFollowLatest = nextPage >= maxPage;
+      }
       return;
     }
     if (this.focusArea === "action") {

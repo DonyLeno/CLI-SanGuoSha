@@ -33,12 +33,19 @@ void test("使用杀会造成伤害或被闪抵消", () => {
   assert.ok(target.hp <= 4);
 });
 
-void test("结束出牌阶段会切换到下一个玩家", () => {
+void test("用户结束出牌阶段后可进入交互弃牌并继续下一玩家", () => {
   const game = new SanGuoGame(fixedRng);
   game.initDefaultGame();
   const endAction = game.getPlayableActions("human").find((action) => action.type === "end");
   assert.ok(endAction);
   game.playAction("human", endAction);
+  assert.equal(game.getSnapshot().currentPlayerId, "human");
+  assert.equal(game.getSnapshot().phase, "弃牌阶段");
+  while (game.getPendingDiscardCount("human") > 0) {
+    const options = game.getDiscardOptions("human");
+    assert.ok(options.length > 0);
+    game.discardForCurrentPlayer("human", options[0]?.handIndex ?? 0);
+  }
   const snapshot = game.getSnapshot();
   assert.equal(snapshot.currentPlayerId, "ai-1");
   assert.equal(snapshot.phase, "出牌阶段");
@@ -73,6 +80,18 @@ void test("支持配置人数、身份与武将", () => {
   assert.ok(human.skills.includes(SkillName.Guard));
   const current = snapshot.players.find((item) => item.id === snapshot.currentPlayerId);
   assert.equal(current?.role, PlayerRole.Lord);
+});
+
+void test("AI 武将会随机且一局内不重复（包含不与玩家武将重复）", () => {
+  const game = new SanGuoGame(() => 0);
+  game.initDefaultGame({
+    playerCount: 6,
+    humanGeneral: "曹仁",
+  });
+  const snapshot = game.getSnapshot();
+  const generalNames = snapshot.players.map((player) => player.general);
+  const uniqueNames = new Set(generalNames);
+  assert.equal(uniqueNames.size, generalNames.length);
 });
 
 void test("6人局默认身份配比符合推荐", () => {
@@ -147,18 +166,26 @@ void test("强袭可用且每回合仅可发动一次", () => {
 void test("坚守会在每回合首次受伤时令伤害-1", () => {
   const game = new SanGuoGame(fixedRng);
   game.initDefaultGame({ aiCount: 4 });
+  const runtime = game as unknown as {
+    players: Array<{
+      id: string;
+      hp: number;
+      skills: SkillName[];
+    }>;
+  };
+  const scriptedTarget = runtime.players.find((item) => item.id === "ai-1");
+  assert.ok(scriptedTarget);
+  scriptedTarget.skills = [SkillName.Guard];
   const before = game.getSnapshot();
-  const targetBefore = before.players.find((item) => item.id === "ai-4");
+  const targetBefore = before.players.find((item) => item.id === "ai-1");
   assert.ok(targetBefore);
-  assert.equal(targetBefore.general, "曹仁");
-  assert.ok(targetBefore.skills.includes(SkillName.Guard));
   const skillAction = game
     .getPlayableActions("human")
     .find((action) => action.type === "skill" && action.skill === SkillName.Assault);
   assert.ok(skillAction);
-  const logs = game.playAction("human", skillAction, "ai-4");
+  const logs = game.playAction("human", skillAction, "ai-1");
   const after = game.getSnapshot();
-  const targetAfter = after.players.find((item) => item.id === "ai-4");
+  const targetAfter = after.players.find((item) => item.id === "ai-1");
   assert.ok(targetAfter);
   assert.equal(targetAfter.hp, targetBefore.hp);
   assert.ok(logs.some((line) => line.includes(SkillName.Guard)));

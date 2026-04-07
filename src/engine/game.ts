@@ -143,6 +143,12 @@ export type ResponseOption = {
   label: string;
 };
 
+export type DiscardOption = {
+  handIndex: number;
+  cardId: string;
+  cardType: CardType;
+};
+
 const drawCountPerTurn = 2;
 
 export enum PlayerRole {
@@ -216,15 +222,6 @@ const commonGeneralPool: GeneralDefinition[] = [
   { kingdom: "魏", name: "曹仁", maxHp: 4, skills: [SkillName.Guard] },
 ];
 
-const aiGeneralPool: GeneralDefinition[] = [
-  commonGeneralPool.find((item) => item.name === "张飞") ?? humanGeneral,
-  commonGeneralPool.find((item) => item.name === "周瑜") ?? humanGeneral,
-  commonGeneralPool.find((item) => item.name === "许褚") ?? humanGeneral,
-  commonGeneralPool.find((item) => item.name === "曹仁") ?? humanGeneral,
-  commonGeneralPool.find((item) => item.name === "赵云") ?? humanGeneral,
-  commonGeneralPool.find((item) => item.name === "吕布") ?? humanGeneral,
-];
-
 export const GENERAL_LIBRARY: GeneralDefinition[] = [humanGeneral, ...commonGeneralPool];
 
 export class SanGuoGame {
@@ -283,9 +280,11 @@ export class SanGuoGame {
     }
 
     this.players = [this.createPlayer("human", initOptions.humanName, false, humanGeneralDefinition, humanRole)];
+    const usedGeneralNames = new Set<string>([humanGeneralDefinition.name]);
     for (let i = 0; i < rolePool.length; i += 1) {
       const role = rolePool[i] ?? PlayerRole.Rebel;
-      const general = aiGeneralPool[i % aiGeneralPool.length] ?? humanGeneral;
+      const general = this.pickRandomUnusedGeneral(usedGeneralNames);
+      usedGeneralNames.add(general.name);
       this.players.push(this.createPlayer(`ai-${i + 1}`, `玩家${this.getAiName(i)}`, true, general, role));
     }
     this.deck = shuffle(createDeck(), this.rng);
@@ -519,6 +518,53 @@ export class SanGuoGame {
 
     actions.push({ type: "end", label: "结束出牌阶段" });
     return actions;
+  }
+
+  getPendingDiscardCount(playerId: string): number {
+    if (this.winner !== null) {
+      return 0;
+    }
+    const player = this.mustGetPlayer(playerId);
+    if (!player.alive || player.id !== this.currentPlayer.id || this.phase !== TurnPhase.Discard) {
+      return 0;
+    }
+    return Math.max(0, player.hand.length - player.hp);
+  }
+
+  getDiscardOptions(playerId: string): DiscardOption[] {
+    if (this.getPendingDiscardCount(playerId) <= 0) {
+      return [];
+    }
+    const player = this.mustGetPlayer(playerId);
+    return player.hand.map((card, handIndex) => ({
+      handIndex,
+      cardId: card.id,
+      cardType: card.type,
+    }));
+  }
+
+  discardForCurrentPlayer(playerId: string, handIndex: number): string[] {
+    if (this.winner !== null) {
+      return [];
+    }
+    const player = this.mustGetPlayer(playerId);
+    if (!player.alive || player.id !== this.currentPlayer.id || this.phase !== TurnPhase.Discard) {
+      return [];
+    }
+    if (!Number.isInteger(handIndex) || handIndex < 0 || handIndex >= player.hand.length) {
+      return ["弃牌选择无效"];
+    }
+    const removed = player.hand.splice(handIndex, 1)[0];
+    if (!removed) {
+      return ["弃牌选择无效"];
+    }
+    this.discardPile.push(removed);
+    const logs = [`${player.name} 弃置了 ${removed.type}`];
+    if (player.hand.length > player.hp) {
+      return logs;
+    }
+    logs.push(...this.finishTurn(player));
+    return logs;
   }
 
   playAction(playerId: string, action: GameAction, targetId?: string): string[] {
@@ -893,6 +939,10 @@ export class SanGuoGame {
     this.phase = TurnPhase.Discard;
     const logs: string[] = [];
     logs.push(`进入${TurnPhase.Discard}`);
+    if (!player.isAI && player.hand.length > player.hp) {
+      logs.push(`${player.name} 需要弃置 ${player.hand.length - player.hp} 张手牌`);
+      return logs;
+    }
     while (player.hand.length > player.hp) {
       const index = this.randomIndex(player.hand.length);
       const removed = player.hand.splice(index, 1)[0];
@@ -901,6 +951,12 @@ export class SanGuoGame {
         logs.push(`${player.name} 弃置了 ${removed.type}`);
       }
     }
+    logs.push(...this.finishTurn(player));
+    return logs;
+  }
+
+  private finishTurn(player: Player): string[] {
+    const logs: string[] = [];
     this.phase = TurnPhase.End;
     logs.push(`进入${TurnPhase.End}`);
     if (this.hasSkill(player, SkillName.BiYue)) {
@@ -1088,12 +1144,7 @@ export class SanGuoGame {
         logs.push(`${target.name} 的藤甲生效，抵消南蛮入侵`);
         continue;
       }
-      const slashIndex = target.hand.findIndex((card) => card.type === CardType.Slash);
-      if (slashIndex >= 0) {
-        const slash = target.hand.splice(slashIndex, 1)[0];
-        if (slash) {
-          this.discardPile.push(slash);
-        }
+      if (this.consumeSlashResponse(target, logs)) {
         logs.push(`${target.name} 打出杀，抵消南蛮入侵`);
       } else {
         this.applyDamage(user, target, 1, "南蛮入侵", logs);
@@ -1115,12 +1166,7 @@ export class SanGuoGame {
         logs.push(`${target.name} 的藤甲生效，抵消万箭齐发`);
         continue;
       }
-      const dodgeIndex = target.hand.findIndex((card) => card.type === CardType.Dodge);
-      if (dodgeIndex >= 0) {
-        const dodge = target.hand.splice(dodgeIndex, 1)[0];
-        if (dodge) {
-          this.discardPile.push(dodge);
-        }
+      if (this.consumeDodgeResponse(target, logs)) {
         logs.push(`${target.name} 打出闪，抵消万箭齐发`);
       } else {
         this.applyDamage(user, target, 1, "万箭齐发", logs);
@@ -2295,6 +2341,16 @@ export class SanGuoGame {
 
   private randomIndex(length: number): number {
     return Math.floor(this.rng() * length);
+  }
+
+  private pickRandomUnusedGeneral(usedGeneralNames: Set<string>): GeneralDefinition {
+    const candidates = GENERAL_LIBRARY.filter((general) => !usedGeneralNames.has(general.name));
+    if (candidates.length <= 0) {
+      const fallback = GENERAL_LIBRARY[this.randomIndex(GENERAL_LIBRARY.length)];
+      return fallback ?? humanGeneral;
+    }
+    const picked = candidates[this.randomIndex(candidates.length)];
+    return picked ?? humanGeneral;
   }
 
   private useSkillAction(
