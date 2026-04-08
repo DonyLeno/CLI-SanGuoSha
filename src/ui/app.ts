@@ -705,7 +705,7 @@ export class CliSanGuoApp {
 
   private executeCommand(command: string): void {
     if (command === "/help") {
-      this.openDisplayOverlay("帮助文档", this.getHelpLines());
+      this.openDisplayOverlay("完整规则", this.rulesLines);
       return;
     }
     if (command === "/rules") {
@@ -732,33 +732,10 @@ export class CliSanGuoApp {
     this.logs.push(`未知命令: ${command}`);
   }
 
-  private getHelpLines(): string[] {
-    const lines: string[] = [];
-    lines.push("=== 帮助 ===");
-    lines.push("【命令】");
-    lines.push("- /help 查看帮助");
-    lines.push("- /rules 查看完整规则文档");
-    lines.push("- /close 关闭当前文档");
-    lines.push("- /exit 退出游戏");
-    lines.push("【翻页】");
-    lines.push("- 左右箭头：切换聚焦区（显示区/操作区/战场状态）");
-    lines.push("- 上下箭头：对当前聚焦区翻页");
-    lines.push("- 聚焦区为绿色边框");
-    lines.push("");
-    const quickHelp = this.getRulesSection("16. 游戏内 /help 短版（可直接复用）");
-    if (quickHelp.length > 0) {
-      lines.push(...quickHelp);
-      return lines;
-    }
-    lines.push("未在 rules.md 中找到“16. 游戏内 /help 短版（可直接复用）”章节。");
-    lines.push("可先使用 /rules 查看完整规则。");
-    return lines;
-  }
-
   private getCommandListLines(): string[] {
     return [
-      "- /help 查看帮助",
-      "- /rules 查看完整规则文档",
+      "- /help 查看完整规则文档",
+      "- /rules 查看完整规则文档（同 /help）",
       "- /close 关闭当前文档",
       "- /exit 退出游戏",
     ];
@@ -772,23 +749,6 @@ export class CliSanGuoApp {
     } catch {
       return ["未找到 rules.md，请先创建规则文件"];
     }
-  }
-
-  private getRulesSection(sectionTitle: string): string[] {
-    const heading = `## ${sectionTitle}`;
-    const start = this.rulesLines.findIndex((line) => line.trim() === heading);
-    if (start < 0) {
-      return [];
-    }
-    const lines: string[] = [];
-    for (let i = start; i < this.rulesLines.length; i += 1) {
-      const current = this.rulesLines[i] ?? "";
-      if (i > start && current.startsWith("## ")) {
-        break;
-      }
-      lines.push(current);
-    }
-    return lines;
   }
 
   private initSetup(): void {
