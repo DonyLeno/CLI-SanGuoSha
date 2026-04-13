@@ -269,6 +269,45 @@ void test("无懈可击会抵消指定目标的锦囊", () => {
   assert.equal(ai1After.hand[0]?.type, CardType.Peach);
 });
 
+void test("过河拆桥可选择装备牌或随机手牌", () => {
+  const game = new SanGuoGame(fixedRng);
+  game.initDefaultGame();
+  const runtime = game as unknown as {
+    players: Array<{
+      id: string;
+      hand: Array<{ id: string; type: CardType }>;
+      weapon: CardType | null;
+    }>;
+  };
+  const human = runtime.players.find((item) => item.id === "human");
+  const ai1 = runtime.players.find((item) => item.id === "ai-1");
+  assert.ok(human);
+  assert.ok(ai1);
+  human.hand = [{ id: "test-dismantle", type: CardType.Dismantle }];
+  ai1.hand = [
+    { id: "target-slash", type: CardType.Slash },
+    { id: "target-peach", type: CardType.Peach },
+  ];
+  ai1.weapon = CardType.Crossbow;
+  const action = game
+    .getPlayableActions("human")
+    .find((item) => item.type === "play" && item.label.includes(CardType.Dismantle));
+  assert.ok(action && action.type === "play");
+  const options = game.getRemovableCardOptions("ai-1");
+  const randomHandOption = options.find((item) => item.id === "hand-random");
+  const hasExposedHandCard = options.some((item) => item.id.startsWith("hand:"));
+  assert.ok(randomHandOption);
+  assert.equal(hasExposedHandCard, false);
+  game.playAction("human", action, "ai-1", randomHandOption.id);
+  const snapshot = game.getSnapshot();
+  const ai1After = snapshot.players.find((item) => item.id === "ai-1");
+  assert.ok(ai1After);
+  assert.equal(ai1After.hand.length, 1);
+  const remainedCardId = ai1After.hand[0]?.id;
+  assert.ok(remainedCardId === "target-slash" || remainedCardId === "target-peach");
+  assert.equal(ai1After.weapon, CardType.Crossbow);
+});
+
 void test("桃园结义会为存活角色回复体力", () => {
   const game = new SanGuoGame(fixedRng);
   game.initDefaultGame();
@@ -950,4 +989,32 @@ void test("救援会让其他吴势力桃救主公时额外回复1点", () => {
   assert.equal(humanAfter.hp, 2);
   assert.equal(ai1After.hand.length, 0);
   assert.ok(logs.some((line) => line.includes(SkillName.JiuYuan)));
+});
+
+void test("当前玩家已阵亡时可自动跳过并推进到下一名存活角色", () => {
+  const game = new SanGuoGame(() => 0);
+  game.initDefaultGame({ aiCount: 2 });
+  const runtime = game as unknown as {
+    currentPlayerIndex: number;
+    players: Array<{
+      id: string;
+      alive: boolean;
+      hp: number;
+      hand: Array<{ id: string; type: CardType }>;
+    }>;
+  };
+  const ai1Index = runtime.players.findIndex((item) => item.id === "ai-1");
+  const ai1 = runtime.players[ai1Index];
+  const ai2 = runtime.players.find((item) => item.id === "ai-2");
+  assert.ok(ai1);
+  assert.ok(ai2);
+  runtime.currentPlayerIndex = ai1Index;
+  ai1.alive = false;
+  ai1.hp = 0;
+  const logs = game.ensureTurnState();
+  const snapshot = game.getSnapshot();
+  assert.equal(snapshot.currentPlayerId, "ai-2");
+  assert.equal(snapshot.phase, "出牌阶段");
+  assert.ok(logs.some((line) => line.includes("跳过其回合")));
+  assert.ok(logs.some((line) => line.includes("ai-2")));
 });

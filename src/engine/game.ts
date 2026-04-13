@@ -149,6 +149,13 @@ export type DiscardOption = {
   cardType: CardType;
 };
 
+export type RemovableCardOption = {
+  id: string;
+  zone: "hand" | "weapon" | "armor" | "defenseHorse" | "attackHorse" | "treasure";
+  cardType: CardType | null;
+  label: string;
+};
+
 const drawCountPerTurn = 2;
 
 export enum PlayerRole {
@@ -336,6 +343,23 @@ export class SanGuoGame {
 
   getCurrentPlayer(): Player {
     return this.currentPlayer;
+  }
+
+  ensureTurnState(): string[] {
+    if (this.winner !== null) {
+      return [];
+    }
+    const current = this.currentPlayer;
+    if (current.alive) {
+      return [];
+    }
+    const logs = [`${current.name} 已阵亡，跳过其回合`];
+    this.moveToNextPlayer();
+    if (this.winner !== null) {
+      return logs;
+    }
+    logs.push(...this.startTurn());
+    return logs;
   }
 
   getCardLibrary() {
@@ -543,6 +567,63 @@ export class SanGuoGame {
     }));
   }
 
+  getRemovableCardOptions(targetId: string): RemovableCardOption[] {
+    const target = this.players.find((item) => item.id === targetId);
+    if (!target || !target.alive) {
+      return [];
+    }
+    const options: RemovableCardOption[] = [];
+    if (target.hand.length > 0) {
+      options.push({
+        id: "hand-random",
+        zone: "hand",
+        cardType: null,
+        label: `手牌（随机1张，当前${target.hand.length}张）`,
+      });
+    }
+    if (target.weapon !== null) {
+      options.push({
+        id: "weapon",
+        zone: "weapon",
+        cardType: target.weapon,
+        label: `武器 ${target.weapon}`,
+      });
+    }
+    if (target.armor !== null) {
+      options.push({
+        id: "armor",
+        zone: "armor",
+        cardType: target.armor,
+        label: `防具 ${target.armor}`,
+      });
+    }
+    if (target.defenseHorse !== null) {
+      options.push({
+        id: "defenseHorse",
+        zone: "defenseHorse",
+        cardType: target.defenseHorse,
+        label: `+1马 ${target.defenseHorse}`,
+      });
+    }
+    if (target.attackHorse !== null) {
+      options.push({
+        id: "attackHorse",
+        zone: "attackHorse",
+        cardType: target.attackHorse,
+        label: `-1马 ${target.attackHorse}`,
+      });
+    }
+    if (target.treasure !== null) {
+      options.push({
+        id: "treasure",
+        zone: "treasure",
+        cardType: target.treasure,
+        label: `宝物 ${target.treasure}`,
+      });
+    }
+    return options;
+  }
+
   discardForCurrentPlayer(playerId: string, handIndex: number): string[] {
     if (this.winner !== null) {
       return [];
@@ -567,7 +648,7 @@ export class SanGuoGame {
     return logs;
   }
 
-  playAction(playerId: string, action: GameAction, targetId?: string): string[] {
+  playAction(playerId: string, action: GameAction, targetId?: string, selectedCardId?: string): string[] {
     if (this.winner !== null) {
       return [];
     }
@@ -612,6 +693,7 @@ export class SanGuoGame {
       logs.push(...this.resolveSlash(player, target, used.color));
       logs.push(...this.resolveDeaths());
       logs.push(...this.resolveWinner());
+      this.advanceIfCurrentPlayerDead(logs);
       return logs;
     }
     if (action.cardIndex <= -400 && action.cardIndex > -1000) {
@@ -645,6 +727,7 @@ export class SanGuoGame {
       logs.push(...this.resolveSlash(player, target, used.color));
       logs.push(...this.resolveDeaths());
       logs.push(...this.resolveWinner());
+      this.advanceIfCurrentPlayerDead(logs);
       return logs;
     }
     if (action.cardIndex === -11) {
@@ -686,7 +769,7 @@ export class SanGuoGame {
       if (!usedCard) {
         return ["使用卡牌失败"];
       }
-      return this.resolveUsedCard(player, usedCard, targetId, true);
+      return this.resolveUsedCard(player, usedCard, targetId, true, selectedCardId);
     }
     if (action.cardIndex === -1) {
       if (player.weapon !== CardType.SerpentSpear || player.hand.length < 2) {
@@ -756,10 +839,16 @@ export class SanGuoGame {
     if (!usedCard) {
       return ["使用卡牌失败"];
     }
-    return this.resolveUsedCard(player, usedCard, targetId, false);
+    return this.resolveUsedCard(player, usedCard, targetId, false, selectedCardId);
   }
 
-  private resolveUsedCard(player: Player, usedCard: Card, targetId: string | undefined, fromTreasure: boolean): string[] {
+  private resolveUsedCard(
+    player: Player,
+    usedCard: Card,
+    targetId: string | undefined,
+    fromTreasure: boolean,
+    selectedCardId?: string,
+  ): string[] {
     this.discardPile.push(usedCard);
     const logs: string[] = [];
     if (fromTreasure) {
@@ -781,9 +870,9 @@ export class SanGuoGame {
       player.hp = Math.min(player.maxHp, player.hp + 1);
       logs.push(`${player.name} 使用桃，回复 1 点体力`);
     } else if (usedCard.type === CardType.Dismantle && targetId) {
-      logs.push(...this.resolveDismantle(player, this.mustGetPlayer(targetId)));
+      logs.push(...this.resolveDismantle(player, this.mustGetPlayer(targetId), selectedCardId));
     } else if (usedCard.type === CardType.Snatch && targetId) {
-      logs.push(...this.resolveSnatch(player, this.mustGetPlayer(targetId)));
+      logs.push(...this.resolveSnatch(player, this.mustGetPlayer(targetId), selectedCardId));
     } else if (usedCard.type === CardType.Duel && targetId) {
       logs.push(...this.resolveDuel(player, this.mustGetPlayer(targetId)));
     } else if (usedCard.type === CardType.ExNihilo) {
@@ -804,6 +893,7 @@ export class SanGuoGame {
     }
     logs.push(...this.resolveDeaths());
     logs.push(...this.resolveWinner());
+    this.advanceIfCurrentPlayerDead(logs);
     return logs;
   }
 
@@ -1068,7 +1158,7 @@ export class SanGuoGame {
     return logs;
   }
 
-  private resolveDismantle(user: Player, target: Player): string[] {
+  private resolveDismantle(user: Player, target: Player, selectedCardId?: string): string[] {
     const logs = [`${user.name} 对 ${target.name} 使用过河拆桥`];
     if (this.tryNegate(target, CardType.Dismantle, logs)) {
       return logs;
@@ -1077,11 +1167,18 @@ export class SanGuoGame {
       logs.push(`${target.name} 没有可拆的牌`);
       return logs;
     }
+    if (selectedCardId) {
+      const removedByChoice = this.removeSelectedCardFromPlayer(target, "弃置", selectedCardId);
+      if (removedByChoice.length > 0) {
+        logs.push(...removedByChoice);
+        return logs;
+      }
+    }
     logs.push(...this.removeRandomCardFromPlayer(target, "弃置"));
     return logs;
   }
 
-  private resolveSnatch(user: Player, target: Player): string[] {
+  private resolveSnatch(user: Player, target: Player, selectedCardId?: string): string[] {
     const logs = [`${user.name} 对 ${target.name} 使用顺手牵羊`];
     if (this.tryNegate(target, CardType.Snatch, logs)) {
       return logs;
@@ -1089,6 +1186,13 @@ export class SanGuoGame {
     if (!this.hasRemovableCard(target)) {
       logs.push(`${target.name} 没有可获得的牌`);
       return logs;
+    }
+    if (selectedCardId) {
+      const removedByChoice = this.removeSelectedCardFromPlayer(target, "获得", selectedCardId, user);
+      if (removedByChoice.length > 0) {
+        logs.push(...removedByChoice);
+        return logs;
+      }
     }
     logs.push(...this.removeRandomCardFromPlayer(target, "获得", user));
     return logs;
@@ -1788,6 +1892,21 @@ export class SanGuoGame {
     }
   }
 
+  private advanceIfCurrentPlayerDead(logs: string[]): void {
+    if (this.winner !== null) {
+      return;
+    }
+    const current = this.players[this.currentPlayerIndex];
+    if (current?.alive) {
+      return;
+    }
+    this.moveToNextPlayer();
+    if (this.winner !== null) {
+      return;
+    }
+    logs.push(...this.startTurn());
+  }
+
   private pickBestAiAction(actions: GameAction[], playerId: string): GameAction | null {
     const player = this.mustGetPlayer(playerId);
     const assault = actions.find((action) => action.type === "skill" && action.skill === SkillName.Assault);
@@ -2071,9 +2190,9 @@ export class SanGuoGame {
   }
 
   private removeRandomCardFromPlayer(player: Player, mode: "弃置" | "获得", receiver?: Player): string[] {
-    const options: Array<"hand" | "weapon" | "armor" | "defenseHorse" | "attackHorse" | "treasure"> = [];
+    const options: string[] = [];
     for (let i = 0; i < player.hand.length; i += 1) {
-      options.push("hand");
+      options.push("hand-random");
     }
     if (player.weapon !== null) {
       options.push("weapon");
@@ -2094,7 +2213,22 @@ export class SanGuoGame {
       return [];
     }
     const picked = options[this.randomIndex(options.length)];
-    if (picked === "hand") {
+    if (!picked) {
+      return [];
+    }
+    return this.removeSelectedCardFromPlayer(player, mode, picked, receiver);
+  }
+
+  private removeSelectedCardFromPlayer(
+    player: Player,
+    mode: "弃置" | "获得",
+    selectedCardId: string,
+    receiver?: Player,
+  ): string[] {
+    if (selectedCardId === "hand-random") {
+      if (player.hand.length === 0) {
+        return [];
+      }
       const index = this.randomIndex(player.hand.length);
       const removed = player.hand.splice(index, 1)[0];
       if (!removed) {
@@ -2105,9 +2239,26 @@ export class SanGuoGame {
         return [`${receiver.name} 获得了 ${player.name} 的 1 张手牌`];
       }
       this.discardPile.push(removed);
-      return [`${player.name} 被弃置 1 张手牌`];
+      return [`${player.name} 的 1 张手牌被弃置`];
     }
-    if (picked === "weapon") {
+    if (selectedCardId.startsWith("hand:")) {
+      const handCardId = selectedCardId.slice(5);
+      const index = player.hand.findIndex((card) => card.id === handCardId);
+      if (index < 0) {
+        return [];
+      }
+      const removed = player.hand.splice(index, 1)[0];
+      if (!removed) {
+        return [];
+      }
+      if (mode === "获得" && receiver) {
+        receiver.hand.push(removed);
+        return [`${receiver.name} 获得了 ${player.name} 的手牌 ${removed.type}`];
+      }
+      this.discardPile.push(removed);
+      return [`${player.name} 的手牌 ${removed.type} 被弃置`];
+    }
+    if (selectedCardId === "weapon") {
       const removedWeapon = player.weapon;
       player.weapon = null;
       if (removedWeapon === null) {
@@ -2120,7 +2271,7 @@ export class SanGuoGame {
       this.discardPile.push(this.createCard(removedWeapon, `discard-${this.turn}`));
       return [`${player.name} 的装备 ${removedWeapon} 被弃置`];
     }
-    if (picked === "armor") {
+    if (selectedCardId === "armor") {
       const removedArmor = player.armor;
       player.armor = null;
       if (removedArmor === null) {
@@ -2137,7 +2288,7 @@ export class SanGuoGame {
       logs.push(...this.onLoseEquip(player, removedArmor));
       return logs;
     }
-    if (picked === "defenseHorse") {
+    if (selectedCardId === "defenseHorse") {
       const removed = player.defenseHorse;
       player.defenseHorse = null;
       if (removed === null) {
@@ -2150,7 +2301,7 @@ export class SanGuoGame {
       this.discardPile.push(this.createCard(removed, `discard-${this.turn}`));
       return [`${player.name} 的装备 ${removed} 被弃置`];
     }
-    if (picked === "attackHorse") {
+    if (selectedCardId === "attackHorse") {
       const removed = player.attackHorse;
       player.attackHorse = null;
       if (removed === null) {
@@ -2162,6 +2313,9 @@ export class SanGuoGame {
       }
       this.discardPile.push(this.createCard(removed, `discard-${this.turn}`));
       return [`${player.name} 的装备 ${removed} 被弃置`];
+    }
+    if (selectedCardId !== "treasure") {
+      return [];
     }
     const removedTreasure = player.treasure;
     player.treasure = null;
@@ -2383,6 +2537,7 @@ export class SanGuoGame {
       this.applyDamage(player, target, 1, SkillName.Assault, logs);
       logs.push(...this.resolveDeaths());
       logs.push(...this.resolveWinner());
+      this.advanceIfCurrentPlayerDead(logs);
       return logs;
     }
     if (action.skill === SkillName.ZhiHeng) {
@@ -2428,6 +2583,7 @@ export class SanGuoGame {
       const logs = [`${player.name} 发动${SkillName.KuRou}，失去 1 点体力并摸了 ${drawn} 张牌`];
       logs.push(...this.resolveDeaths());
       logs.push(...this.resolveWinner());
+      this.advanceIfCurrentPlayerDead(logs);
       return logs;
     }
     return [`${player.name} 发动了未知技能`];

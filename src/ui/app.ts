@@ -2,6 +2,7 @@ import { BoxRenderable, KeyEvent, TextRenderable, createCliRenderer } from "@ope
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { AiDriverLabel, AiModelProvider, GameAiLoop } from "../agent/ai.js";
+import { LocalAiEngine } from "../agent/local-engine.js";
 import { RoundPromptContext } from "../agent/prompt.js";
 import { CardType } from "../engine/cards.js";
 import {
@@ -9,14 +10,17 @@ import {
   GameInitOptions,
   Player,
   PlayerRole,
+  RemovableCardOption,
   ResponseKind,
   ResponseOption,
   SanGuoGame,
 } from "../engine/game.js";
 
-type InputMode = "setup" | "action" | "target" | "response" | "discard" | "gameover";
+type InputMode = "setup" | "action" | "target" | "target-card" | "response" | "discard" | "gameover";
 
 type SetupStage = "player-count" | "role" | "kingdom" | "general" | "ai-model" | "ollama-model" | "start";
+
+type SetupAiModel = "simple" | AiModelProvider;
 
 type Kingdom = "魏" | "蜀" | "吴" | "群雄";
 
@@ -67,6 +71,10 @@ export class CliSanGuoApp {
 
   private pendingAiResponse: PendingAiResponse | null;
 
+  private pendingTargetId: string | null;
+
+  private targetCardOptions: RemovableCardOption[];
+
   private commandBuffer: string | null;
 
   private readonly options: AppOptions;
@@ -76,6 +84,8 @@ export class CliSanGuoApp {
   private readonly rulesLines: string[];
 
   private readonly aiLoop: GameAiLoop;
+
+  private readonly localAiEngine: LocalAiEngine;
 
   private displayOverlayTitle: string | null;
 
@@ -99,7 +109,7 @@ export class CliSanGuoApp {
 
   private setupGeneralName: string;
 
-  private setupAiModel: AiModelProvider;
+  private setupAiModel: SetupAiModel;
 
   private setupOllamaModel: string;
 
@@ -124,10 +134,13 @@ export class CliSanGuoApp {
     this.targetOptions = [];
     this.pendingAction = null;
     this.pendingAiResponse = null;
+    this.pendingTargetId = null;
+    this.targetCardOptions = [];
     this.commandBuffer = null;
     this.generalLibrary = this.game.getGeneralLibrary();
     this.rulesLines = this.loadRulesLines();
     this.aiLoop = new GameAiLoop(this.rulesLines.join("\n"));
+    this.localAiEngine = new LocalAiEngine(this.rulesLines.join("\n"));
     this.displayOverlayTitle = null;
     this.displayOverlayLines = [];
     this.displayPage = 0;
@@ -276,6 +289,13 @@ export class CliSanGuoApp {
       this.refresh();
       return;
     }
+    if (this.mode === "target-card" && event.name === "b") {
+      this.pendingTargetId = null;
+      this.targetCardOptions = [];
+      this.mode = "target";
+      this.refresh();
+      return;
+    }
     const picked = this.toOptionIndex(event);
     if (picked === null) {
       return;
@@ -294,6 +314,20 @@ export class CliSanGuoApp {
         return;
       }
       void this.handleTargetChoice(target.id);
+      return;
+    }
+    if (this.mode === "target-card") {
+      if (this.targetCardOptions.length === 0) {
+        if (picked === 0) {
+          void this.handleTargetCardChoice("");
+        }
+        return;
+      }
+      const option = this.targetCardOptions[picked];
+      if (!option) {
+        return;
+      }
+      void this.handleTargetCardChoice(option.id);
     }
   }
 
@@ -325,9 +359,32 @@ export class CliSanGuoApp {
     if (!this.pendingAction) {
       return;
     }
+    if (this.shouldSelectTargetCard(this.pendingAction)) {
+      this.pendingTargetId = targetId;
+      this.targetCardOptions = this.game.getRemovableCardOptions(targetId);
+      this.mode = "target-card";
+      this.refresh();
+      return;
+    }
     const current = this.game.getCurrentPlayer();
     await this.playAndAppendLogs(current.id, this.pendingAction, targetId);
     this.pendingAction = null;
+    this.pendingTargetId = null;
+    this.targetCardOptions = [];
+    this.targetOptions = [];
+    this.mode = "action";
+    await this.resolveAiTurns();
+  }
+
+  private async handleTargetCardChoice(selectedCardId: string): Promise<void> {
+    if (!this.pendingAction || !this.pendingTargetId) {
+      return;
+    }
+    const current = this.game.getCurrentPlayer();
+    await this.playAndAppendLogs(current.id, this.pendingAction, this.pendingTargetId, undefined, selectedCardId);
+    this.pendingAction = null;
+    this.pendingTargetId = null;
+    this.targetCardOptions = [];
     this.targetOptions = [];
     this.mode = "action";
     await this.resolveAiTurns();
@@ -366,22 +423,49 @@ export class CliSanGuoApp {
 
   private async resolveAiTurns(): Promise<void> {
     while (!this.game.getSnapshot().gameOver && this.game.getCurrentPlayer().isAI) {
+      const turnStateLogs = this.game.ensureTurnState();
+      if (turnStateLogs.length > 0) {
+        for (const line of turnStateLogs) {
+          this.logs.push(line);
+          this.refresh();
+          await this.delay(120);
+        }
+        continue;
+      }
       const ai = this.game.getCurrentPlayer();
       const snapshot = this.game.getSnapshot();
-      this.aiLoop.setPreviousRoundContexts(this.getPreviousRoundPromptContexts(snapshot.turn));
-      const modelDecision = await this.aiLoop.decide(this.game, ai.id);
-      const decision = modelDecision ?? this.game.getBestAiDecision(ai.id);
+      const previousRounds = this.getPreviousRoundPromptContexts(snapshot.turn);
+      this.aiLoop.setPreviousRoundContexts(previousRounds);
+      this.localAiEngine.syncPreviousRounds(previousRounds);
+      const modelDecision = this.setupAiModel === "simple" ? null : await this.aiLoop.decide(this.game, ai.id);
+      const localDecision = this.localAiEngine.decide(this.game, ai.id);
+      const fallbackDecision = localDecision
+        ? localDecision.targetId
+          ? { action: localDecision.action, targetId: localDecision.targetId }
+          : { action: localDecision.action }
+        : this.game.getBestAiDecision(ai.id);
+      const decision = modelDecision ?? fallbackDecision;
       const driverLabel: AiDriverLabel | "本地AI" = modelDecision?.driverLabel ?? "本地AI";
-      const fallbackReason = !modelDecision ? this.aiLoop.getLastFailureReason() : null;
-      if (!decision) {
-        break;
+      const fallbackReason = !modelDecision && this.setupAiModel !== "simple" ? this.aiLoop.getLastFailureReason() : null;
+      const normalizedDecision = this.normalizeAiDecision(ai.id, decision);
+      if (!normalizedDecision) {
+        const forcedEndAction = this.game.getPlayableActions(ai.id).find((action) => action.type === "end");
+        if (!forcedEndAction) {
+          break;
+        }
+        await this.playAndAppendLogs(ai.id, forcedEndAction, undefined, 120);
+        continue;
       }
-      const targetText = decision.targetId ? ` -> ${this.labelPlayer(decision.targetId)}` : "";
+      if (!modelDecision && localDecision) {
+        this.logs.push(`[本地AI-预判] ${ai.name}：${localDecision.insight}`);
+      }
+      const targetText = normalizedDecision.targetId ? ` -> ${this.labelPlayer(normalizedDecision.targetId)}` : "";
       const reasonText = fallbackReason ? `（回退原因：${fallbackReason}）` : "";
-      this.logs.push(`[${driverLabel}] ${ai.name} 选择：${decision.action.label}${targetText}${reasonText}`);
+      const actionDelayMs = driverLabel === "本地AI" ? 1000 : 200;
+      this.logs.push(`[${driverLabel}] ${ai.name} 选择：${normalizedDecision.action.label}${targetText}${reasonText}`);
       this.refresh();
-      await this.delay(200);
-      const response = this.buildPendingResponse(decision, driverLabel);
+      await this.delay(actionDelayMs);
+      const response = this.buildPendingResponse(normalizedDecision, driverLabel);
       if (response) {
         if (response.targetId === "human" && response.options.length === 0) {
           this.game.setPlayerResponsePolicy("human", { [response.responseKind]: false });
@@ -389,7 +473,7 @@ export class CliSanGuoApp {
           this.logs.push(`你没有可用于响应 ${response.cardName} 的手牌，自动继续结算`);
           this.refresh();
           await this.delay(120);
-          await this.playAndAppendLogs(ai.id, decision.action, decision.targetId, 200);
+          await this.playAndAppendLogs(ai.id, normalizedDecision.action, normalizedDecision.targetId, 200);
           this.game.setPlayerResponseSelection("human", response.responseKind, null);
           this.game.setPlayerResponsePolicy("human", null);
           continue;
@@ -399,10 +483,57 @@ export class CliSanGuoApp {
         this.refresh();
         return;
       }
-      await this.playAndAppendLogs(ai.id, decision.action, decision.targetId, 200);
+      await this.playAndAppendLogs(ai.id, normalizedDecision.action, normalizedDecision.targetId, 200);
     }
     this.mode = this.game.getSnapshot().gameOver ? "gameover" : "action";
     this.refresh();
+  }
+
+  private normalizeAiDecision(
+    playerId: string,
+    decision: { action: GameAction; targetId?: string } | null | undefined,
+  ): { action: GameAction; targetId?: string } | null {
+    if (!decision) {
+      return null;
+    }
+    const actions = this.game.getPlayableActions(playerId);
+    const matchedAction = actions.find((action) => this.isSameAction(action, decision.action));
+    if (!matchedAction) {
+      return null;
+    }
+    if (matchedAction.type === "end") {
+      return { action: matchedAction };
+    }
+    if (matchedAction.type !== "play" && matchedAction.type !== "skill") {
+      return { action: matchedAction };
+    }
+    if (!matchedAction.requiresTarget) {
+      return { action: matchedAction };
+    }
+    const targetId =
+      decision.targetId && matchedAction.targets.includes(decision.targetId)
+        ? decision.targetId
+        : (matchedAction.targets[0] ?? null);
+    if (!targetId) {
+      return null;
+    }
+    return { action: matchedAction, targetId };
+  }
+
+  private isSameAction(left: GameAction, right: GameAction): boolean {
+    if (left.type !== right.type) {
+      return false;
+    }
+    if (left.type === "end" && right.type === "end") {
+      return true;
+    }
+    if (left.type === "skill" && right.type === "skill") {
+      return left.skill === right.skill && left.label === right.label;
+    }
+    if (left.type === "play" && right.type === "play") {
+      return left.cardIndex === right.cardIndex && left.label === right.label;
+    }
+    return false;
   }
 
   private refresh(): void {
@@ -433,6 +564,10 @@ export class CliSanGuoApp {
     } else if (this.mode === "action") {
       this.actionOptions.forEach((action, index) => {
         actionLines.push(`${index + 1}. ${action.label}`);
+        const actionHint = this.getActionHint(action);
+        if (actionHint.length > 0) {
+          actionLines.push(`   功能：${actionHint}`);
+        }
       });
       if (this.actionOptions.length === 0) {
         actionLines.push("等待 AI 执行...");
@@ -444,6 +579,18 @@ export class CliSanGuoApp {
           `${index + 1}. 目标 ${target.name} | HP ${Math.max(target.hp, 0)}/${target.maxHp} | 手牌 ${target.hand.length} 张`,
         );
       });
+      actionLines.push("按 b 返回上一步");
+    } else if (this.mode === "target-card") {
+      const targetName = this.pendingTargetId ? this.labelPlayer(this.pendingTargetId) : "目标";
+      actionLines.push(`当前操作: ${this.pendingAction ? this.pendingAction.label : "选择牌"}`);
+      actionLines.push(`目标: ${targetName}，请选择要${this.isSnatchAction(this.pendingAction) ? "获取" : "弃置"}的牌`);
+      this.targetCardOptions.forEach((option, index) => {
+        actionLines.push(`${index + 1}. ${option.label}`);
+      });
+      if (this.targetCardOptions.length === 0) {
+        actionLines.push("目标没有可选牌，将按默认规则结算");
+        actionLines.push("1. 继续结算");
+      }
       actionLines.push("按 b 返回上一步");
     } else if (this.mode === "response") {
       const responseInfo = this.pendingAiResponse;
@@ -621,8 +768,11 @@ export class CliSanGuoApp {
 
   private restart(): void {
     this.aiLoop.stop();
+    this.localAiEngine.reset();
     this.logs = [];
     this.pendingAction = null;
+    this.pendingTargetId = null;
+    this.targetCardOptions = [];
     this.commandBuffer = null;
     this.closeDisplayOverlay();
     this.targetOptions = [];
@@ -795,21 +945,23 @@ export class CliSanGuoApp {
                     ? "步骤7/7：开始游戏"
                     : "步骤6/6：开始游戏";
     const leftLines: string[] = [];
-    leftLines.push("输入“/”进入命令模式，建议先用 /help 查看帮助文档");
-    leftLines.push("");
-    leftLines.push("开局配置");
-    leftLines.push(stageTitle);
-    leftLines.push("");
-    leftLines.push(`- 游玩人数: ${this.setupPlayerCount}`);
-    leftLines.push(`- 默认配比: ${this.getRoleDistributionText(this.setupPlayerCount)}`);
-    leftLines.push(`- 我的身份: ${this.setupRole}`);
-    leftLines.push(`- 势力: ${this.setupKingdom}`);
-    leftLines.push(`- 我的武将: ${this.setupGeneralName}`);
-    leftLines.push(`- 默认AI模型: ${this.getAiModelLabel(this.setupAiModel)}`);
-    if (this.setupAiModel === "ollama") {
-      leftLines.push(`- Ollama具体模型: ${this.setupOllamaModel}`);
-    }
-    if (this.setupStage !== "player-count") {
+    if (this.setupStage === "player-count") {
+      leftLines.push("请在操作区选择游玩人数");
+    } else {
+      leftLines.push("输入“/”进入命令模式，建议先用 /help 查看帮助文档");
+      leftLines.push("");
+      leftLines.push("开局配置");
+      leftLines.push(stageTitle);
+      leftLines.push("");
+      leftLines.push(`- 游玩人数: ${this.setupPlayerCount}`);
+      leftLines.push(`- 默认配比: ${this.getRoleDistributionText(this.setupPlayerCount)}`);
+      leftLines.push(`- 我的身份: ${this.setupRole}`);
+      leftLines.push(`- 势力: ${this.setupKingdom}`);
+      leftLines.push(`- 我的武将: ${this.setupGeneralName}`);
+      leftLines.push(`- 默认AI模型: ${this.getAiModelLabel(this.setupAiModel)}`);
+      if (this.setupAiModel === "ollama") {
+        leftLines.push(`- Ollama具体模型: ${this.setupOllamaModel}`);
+      }
       leftLines.push("");
       leftLines.push("按 b 返回上一步");
     }
@@ -1001,7 +1153,7 @@ export class CliSanGuoApp {
     }
     if (this.setupStage === "ai-model") {
       return this.getAiModelOptions().map((model) => {
-        const desc = model === "ollama" ? "本地 Ollama 模型" : "云端 Qwen 模型";
+        const desc = model === "simple" ? "本地简单逻辑引擎" : model === "ollama" ? "本地 Ollama 模型" : "云端 Qwen 模型";
         return `${this.getAiModelLabel(model)}（${desc}）`;
       });
     }
@@ -1065,11 +1217,14 @@ export class CliSanGuoApp {
     return this.generalLibrary.filter((general) => general.kingdom === kingdom);
   }
 
-  private getAiModelOptions(): AiModelProvider[] {
-    return ["ollama", "qwen"];
+  private getAiModelOptions(): SetupAiModel[] {
+    return ["simple", "ollama", "qwen"];
   }
 
-  private getAiModelLabel(model: AiModelProvider): string {
+  private getAiModelLabel(model: SetupAiModel): string {
+    if (model === "simple") {
+      return "Simple AI";
+    }
     return model === "ollama" ? "Ollama" : "Qwen";
   }
 
@@ -1091,11 +1246,19 @@ export class CliSanGuoApp {
 
   private startConfiguredGame(): void {
     this.aiLoop.stop();
-    this.aiLoop.setPreferredProvider(this.setupAiModel);
-    this.aiLoop.setPreferredOllamaModel(this.setupAiModel === "ollama" ? this.setupOllamaModel : null);
+    this.localAiEngine.reset();
+    if (this.setupAiModel === "ollama" || this.setupAiModel === "qwen") {
+      this.aiLoop.setPreferredProvider(this.setupAiModel);
+      this.aiLoop.setPreferredOllamaModel(this.setupAiModel === "ollama" ? this.setupOllamaModel : null);
+    } else {
+      this.aiLoop.setPreferredProvider("ollama");
+      this.aiLoop.setPreferredOllamaModel(null);
+    }
     this.logs = [];
     this.pendingAction = null;
     this.pendingAiResponse = null;
+    this.pendingTargetId = null;
+    this.targetCardOptions = [];
     this.targetOptions = [];
     this.actionOptions = [];
     this.commandBuffer = null;
@@ -1115,9 +1278,17 @@ export class CliSanGuoApp {
     );
     const subAgentCount = this.aiLoop.start(this.game.getSnapshot());
     const providerText =
-      this.setupAiModel === "ollama" ? `Ollama(${this.setupOllamaModel})` : this.getAiModelLabel(this.setupAiModel);
+      this.setupAiModel === "ollama"
+        ? `Ollama(${this.setupOllamaModel})`
+        : this.setupAiModel === "simple"
+          ? "Simple AI(本地逻辑引擎)"
+          : this.getAiModelLabel(this.setupAiModel);
     this.logs.push(`AI 决策环已启动，默认模型 ${providerText}，创建 ${subAgentCount} 个 subagent`);
-    void this.logAiLoopStatus();
+    if (this.setupAiModel === "simple") {
+      this.logs.push(`AI 驱动: 使用本地AI（${this.localAiEngine.getMemorySummary()}）`);
+    } else {
+      void this.logAiLoopStatus();
+    }
     this.mode = "action";
     void this.resolveAiTurns();
     this.refresh();
@@ -1134,10 +1305,16 @@ export class CliSanGuoApp {
     this.refresh();
   }
 
-  private async playAndAppendLogs(playerId: string, action: GameAction, targetId?: string, delayMs?: number): Promise<void> {
+  private async playAndAppendLogs(
+    playerId: string,
+    action: GameAction,
+    targetId?: string,
+    delayMs?: number,
+    selectedCardId?: string,
+  ): Promise<void> {
     this.busy = true;
     try {
-      const logs = this.game.playAction(playerId, action, targetId);
+      const logs = this.game.playAction(playerId, action, targetId, selectedCardId);
       const stepDelay = delayMs ?? (playerId === "human" ? 100 : 200);
       for (const line of logs) {
         this.logs.push(line);
@@ -1299,6 +1476,137 @@ export class CliSanGuoApp {
     return picked ?? null;
   }
 
+  private shouldSelectTargetCard(action: TargetAction): boolean {
+    if (action.type !== "play") {
+      return false;
+    }
+    const cardType = this.extractCardTypeFromAction(action);
+    return cardType === CardType.Dismantle || cardType === CardType.Snatch;
+  }
+
+  private isSnatchAction(action: TargetAction | null): boolean {
+    if (!action || action.type !== "play") {
+      return false;
+    }
+    return this.extractCardTypeFromAction(action) === CardType.Snatch;
+  }
+
+  private getActionHint(action: GameAction): string {
+    if (action.type === "end") {
+      return "结束当前出牌阶段并进入弃牌/结算流程";
+    }
+    if (action.type === "skill") {
+      if (action.label.includes("强袭")) {
+        return "弃1张牌并对1名目标造成1点伤害（每回合限一次）";
+      }
+      if (action.label.includes("制衡")) {
+        return "弃任意张牌并摸等量牌（每回合限一次）";
+      }
+      if (action.label.includes("青囊")) {
+        return "弃1张手牌令1名角色回复1点体力（每回合限一次）";
+      }
+      if (action.label.includes("苦肉")) {
+        return "失去1点体力并摸2张牌";
+      }
+      return "发动武将技能获得额外收益";
+    }
+    if (action.label.includes("木牛流马下的")) {
+      return "从木牛流马中打出寄存牌，并按该牌原效果结算";
+    }
+    const cardType = this.extractCardTypeFromAction(action);
+    if (!cardType) {
+      return action.requiresTarget ? "使用此牌并选择目标" : "使用此牌立即生效";
+    }
+    if (cardType === CardType.Slash) {
+      return "对1名角色造成1点伤害（可被闪抵消）";
+    }
+    if (cardType === CardType.Peach) {
+      return "回复1点体力";
+    }
+    if (cardType === CardType.Duel) {
+      return "与你指定目标轮流打出杀，先断者受1点伤害";
+    }
+    if (cardType === CardType.Dismantle) {
+      return "弃置目标区域内1张牌";
+    }
+    if (cardType === CardType.Snatch) {
+      return "获得目标区域内1张牌";
+    }
+    if (cardType === CardType.ExNihilo) {
+      return "摸2张牌";
+    }
+    if (cardType === CardType.PeachGarden) {
+      return "所有存活角色各回复1点体力";
+    }
+    if (cardType === CardType.Harvest) {
+      return "所有存活角色各摸1张牌";
+    }
+    if (cardType === CardType.Barbarian) {
+      return "其他角色需打出杀，否则受到1点伤害";
+    }
+    if (cardType === CardType.ArrowRain) {
+      return "其他角色需打出闪，否则受到1点伤害";
+    }
+    if (cardType === CardType.Collateral) {
+      return "指定装备武器角色对其攻击范围内目标出杀，否则其武器被弃置";
+    }
+    if (cardType === CardType.Negate) {
+      return "抵消一张锦囊牌对单个目标的生效";
+    }
+    if (cardType === CardType.Crossbow) {
+      return "武器：攻击范围2，出牌阶段可无限次使用杀";
+    }
+    if (cardType === CardType.FemaleSword) {
+      return "武器：攻击范围2；异性目标响应杀后，随机弃其1手牌或你摸1张";
+    }
+    if (cardType === CardType.QinggangSword) {
+      return "武器：攻击范围2；你使用的杀无视目标防具";
+    }
+    if (cardType === CardType.IceSword) {
+      return "武器：攻击范围2；杀将造成伤害时可改为弃目标2张牌";
+    }
+    if (cardType === CardType.GudingBlade) {
+      return "武器：攻击范围2；目标无手牌时，你的杀伤害+1";
+    }
+    if (cardType === CardType.SerpentSpear) {
+      return "武器：攻击范围3；可弃2张手牌当1张杀使用";
+    }
+    if (cardType === CardType.GreenDragonBlade) {
+      return "武器：攻击范围3；杀被闪后可追加再出1张杀";
+    }
+    if (cardType === CardType.RockCleavingAxe) {
+      return "武器：攻击范围3；杀被闪后可弃2张牌令此杀仍命中";
+    }
+    if (cardType === CardType.Halberd) {
+      return "武器：攻击范围4；最后一张手牌为杀时可额外指定至多2个目标";
+    }
+    if (cardType === CardType.KylinBow) {
+      return "武器：攻击范围5；杀造成伤害后可弃置目标坐骑";
+    }
+    if (cardType === CardType.EightDiagram) {
+      return "防具：受杀时有概率视为自动打出闪";
+    }
+    if (cardType === CardType.RenwangShield) {
+      return "防具：黑色杀对你无效";
+    }
+    if (cardType === CardType.VineArmor) {
+      return "防具：普通杀、南蛮入侵、万箭齐发对你无效";
+    }
+    if (cardType === CardType.SilverLion) {
+      return "防具：受到超过1点伤害时改为1点；失去此防具时回复1点体力";
+    }
+    if (cardType === CardType.Dilu || cardType === CardType.JueYing || cardType === CardType.ZhuaHuangFeiDian) {
+      return "防御马：其他角色计算到你的距离+1，更不容易被指定为目标";
+    }
+    if (cardType === CardType.ChiTu || cardType === CardType.DaYuan || cardType === CardType.ZiXing) {
+      return "进攻马：你计算到其他角色的距离-1，更容易命中远处目标";
+    }
+    if (cardType === CardType.WoodenOx) {
+      return "宝物：可寄存手牌并转移给其他角色，也可直接使用寄存牌";
+    }
+    return action.requiresTarget ? "使用装备或锦囊并选择目标" : "使用装备牌并立即生效";
+  }
+
   private delay(ms: number): Promise<void> {
     return new Promise((resolveDelay) => {
       setTimeout(resolveDelay, ms);
@@ -1333,18 +1641,17 @@ export class CliSanGuoApp {
       body.push("");
     }
     const output: string[] = [];
-    output.push(`${input.title}（${page + 1}/${totalPages}）`);
-    output.push(input.focused ? "聚焦区：← → 切换 | ↑ ↓ 翻页" : "未聚焦：← → 切换到此区");
-    output.push("");
+    const hint = input.focused ? " | ←→切区 ↑↓翻页" : "";
+    output.push(`${input.title}（${page + 1}/${totalPages}）${hint}`);
     output.push(...body);
     return { lines: output, page, totalPages };
   }
 
   private getBodyPageSize(area: FocusArea): number {
     const rows = process.stdout.rows ?? 40;
-    const reserved = area === "display" ? 11 : 9;
+    const reserved = area === "display" ? 7 : 6;
     const pageSize = rows - reserved;
-    return Math.max(6, pageSize);
+    return Math.max(4, pageSize);
   }
 
   private getMaxPage(totalLines: number, pageSize: number): number {
@@ -1370,19 +1677,11 @@ export class CliSanGuoApp {
       return true;
     }
     if (event.name === "up") {
-      if (this.focusArea !== "display") {
-        this.focusArea = "display";
-        this.updateFocusFrame();
-      }
       this.changeFocusedPage(-1);
       this.refresh();
       return true;
     }
     if (event.name === "down") {
-      if (this.focusArea !== "display") {
-        this.focusArea = "display";
-        this.updateFocusFrame();
-      }
       this.changeFocusedPage(1);
       this.refresh();
       return true;
