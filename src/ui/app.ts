@@ -1,28 +1,22 @@
-import { BoxRenderable, KeyEvent, TextRenderable, createCliRenderer } from "@opentui/core";
+import { BoxRenderable, KeyEvent, TextRenderable, bold, createCliRenderer, fg, t } from "@opentui/core";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { AiDriverLabel, AiModelProvider, GameAiLoop } from "../agent/ai.js";
+import { AiModelProvider, GameAiLoop } from "../agent/ai.js";
 import { LocalAiEngine } from "../agent/local-engine.js";
 import { RoundPromptContext } from "../agent/prompt.js";
+import { buildBattlefieldLines, buildRoundContexts, trackRoundBattlefield } from "../agent/round-context.js";
+import { computeAiTurnActionLimit, pickAiTurnDecision } from "../agent/turn-decision.js";
 import { CardType } from "../engine/cards.js";
-import {
-  GameAction,
-  GameInitOptions,
-  Player,
-  PlayerRole,
-  RemovableCardOption,
-  ResponseKind,
-  ResponseOption,
-  SanGuoGame,
-} from "../engine/game.js";
+import { GameAction, GameInitOptions, GeneralDefinition, InteractionDecision, InteractionRequest, Player, PlayerRole, RemovableCardOption, SanGuoGame } from "../engine/game.js";
+import { actionRequiresTargetCardSelection, extractCardTypeFromAction, getActionHint } from "./action-hints.js";
+import { CODEX_THEME } from "./codex-theme.js";
+import { buildActionLines, buildChatLines, buildDisplayLines, buildStatusLines, ChatMessageView } from "./render-lines.js";
 
 type InputMode = "setup" | "action" | "target" | "target-card" | "response" | "discard" | "gameover";
 
-type SetupStage = "player-count" | "role" | "kingdom" | "general" | "ai-model" | "ollama-model" | "start";
+type SetupStage = "player-count" | "role" | "general" | "ai-model" | "ollama-model" | "start";
 
 type SetupAiModel = "simple" | AiModelProvider;
-
-type Kingdom = "魏" | "蜀" | "吴" | "群雄";
 
 type FocusArea = "display" | "action" | "status";
 
@@ -32,26 +26,24 @@ type AppOptions = {
 
 type TargetAction = Exclude<GameAction, { type: "end" }>;
 
-type PendingAiResponse = {
-  actorId: string;
-  action: GameAction;
-  targetId?: string;
-  responseKind: ResponseKind;
-  cardName: string;
-  options: ResponseOption[];
-  driverLabel: AiDriverLabel | "本地AI";
-};
+const CHAT_PANEL_HEIGHT = 8;
+const MAX_CHAT_MESSAGES = 100;
+const MAX_CHAT_LENGTH = 120;
 
 export class CliSanGuoApp {
   private readonly game: SanGuoGame;
 
   private renderer?: Awaited<ReturnType<typeof createCliRenderer>>;
 
+  private headerView?: TextRenderable;
+
   private battlefieldView?: TextRenderable;
 
   private actionView?: TextRenderable;
 
   private logsView?: TextRenderable;
+
+  private chatView?: TextRenderable;
 
   private displayColumn?: BoxRenderable;
 
@@ -61,6 +53,8 @@ export class CliSanGuoApp {
 
   private logs: string[];
 
+  private chatMessages: ChatMessageView[];
+
   private mode: InputMode;
 
   private actionOptions: GameAction[];
@@ -69,7 +63,7 @@ export class CliSanGuoApp {
 
   private pendingAction: TargetAction | null;
 
-  private pendingAiResponse: PendingAiResponse | null;
+  private pendingInteraction: { request: InteractionRequest; resolve: (decision: InteractionDecision) => void } | null;
 
   private pendingTargetId: string | null;
 
@@ -105,9 +99,11 @@ export class CliSanGuoApp {
 
   private setupRole: PlayerRole;
 
-  private setupKingdom: Kingdom;
-
   private setupGeneralName: string;
+
+  private setupGeneralCandidates: GeneralDefinition[];
+
+  private setupGeneralAssignments: Record<string, string>;
 
   private setupAiModel: SetupAiModel;
 
@@ -125,15 +121,18 @@ export class CliSanGuoApp {
 
   private roundBattlefieldHistory: Map<number, string[]>;
 
+  private readonly maxContextRounds: number;
+
   constructor(game: SanGuoGame, options: AppOptions) {
     this.game = game;
     this.options = options;
     this.logs = [];
+    this.chatMessages = [];
     this.mode = "setup";
     this.actionOptions = [];
     this.targetOptions = [];
     this.pendingAction = null;
-    this.pendingAiResponse = null;
+    this.pendingInteraction = null;
     this.pendingTargetId = null;
     this.targetCardOptions = [];
     this.commandBuffer = null;
@@ -150,8 +149,9 @@ export class CliSanGuoApp {
     this.setupStage = "player-count";
     this.setupPlayerCount = 3;
     this.setupRole = PlayerRole.Lord;
-    this.setupKingdom = "吴";
-    this.setupGeneralName = this.generalLibrary[0]?.name ?? "孙策";
+    this.setupGeneralName = "待选择";
+    this.setupGeneralCandidates = [];
+    this.setupGeneralAssignments = {};
     this.setupAiModel = "qwen";
     this.setupOllamaModel = "gemma4:latest";
     this.setupOllamaModels = [];
@@ -160,6 +160,15 @@ export class CliSanGuoApp {
     this.focusArea = "display";
     this.busy = false;
     this.roundBattlefieldHistory = new Map();
+    this.maxContextRounds = this.readContextRounds();
+    this.aiLoop.setMaxContextRounds(this.maxContextRounds);
+    this.localAiEngine.setMaxContextRounds(this.maxContextRounds);
+  }
+
+  private readContextRounds(): number {
+    const raw = process.env.SG_AI_CONTEXT_ROUNDS;
+    const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : 30;
   }
 
   async start(): Promise<void> {
@@ -168,22 +177,55 @@ export class CliSanGuoApp {
       consoleMode: "disabled",
       screenMode: "alternate-screen",
       useMouse: false,
+      backgroundColor: CODEX_THEME.canvas,
     });
 
     const rootBox = new BoxRenderable(this.renderer, {
       width: "100%",
       height: "100%",
-      border: true,
-      title: "CLI SanGuo",
+      border: false,
+      backgroundColor: CODEX_THEME.canvas,
       padding: 1,
+      rowGap: 1,
+      flexDirection: "column",
+    });
+
+    const headerBox = new BoxRenderable(this.renderer, {
+      width: "100%",
+      height: 4,
+      border: true,
+      borderStyle: "rounded",
+      borderColor: CODEX_THEME.border,
+      backgroundColor: CODEX_THEME.surface,
+      title: " >_ CLI 三国杀 ",
+      paddingX: 1,
+    });
+
+    this.headerView = new TextRenderable(this.renderer, {
+      width: "100%",
+      height: "100%",
+      content: "",
+      fg: CODEX_THEME.text,
+      bg: CODEX_THEME.surface,
+      selectable: false,
+    });
+
+    const workspaceBox = new BoxRenderable(this.renderer, {
+      width: "100%",
+      flexGrow: 1,
       flexDirection: "row",
+      columnGap: 1,
+      backgroundColor: CODEX_THEME.canvas,
     });
 
     this.displayColumn = new BoxRenderable(this.renderer, {
       width: "40%",
       height: "100%",
       border: true,
-      title: "显示区",
+      borderStyle: "rounded",
+      borderColor: CODEX_THEME.border,
+      backgroundColor: CODEX_THEME.surface,
+      title: " 对局记录 ",
       padding: 1,
       flexDirection: "column",
     });
@@ -192,7 +234,10 @@ export class CliSanGuoApp {
       width: "30%",
       height: "100%",
       border: true,
-      title: "操作区",
+      borderStyle: "rounded",
+      borderColor: CODEX_THEME.border,
+      backgroundColor: CODEX_THEME.surface,
+      title: " 下一步 ",
       padding: 1,
       flexDirection: "column",
     });
@@ -201,42 +246,75 @@ export class CliSanGuoApp {
       width: "30%",
       height: "100%",
       border: true,
-      title: "战场状态",
+      borderStyle: "rounded",
+      borderColor: CODEX_THEME.border,
+      backgroundColor: CODEX_THEME.surface,
+      title: " 聊天 / 战场 ",
       padding: 1,
       flexDirection: "column",
-    });
-
-    const displayBox = new BoxRenderable(this.renderer, {
-      width: "100%",
-      height: "100%",
-      padding: 1,
+      rowGap: 1,
     });
 
     this.battlefieldView = new TextRenderable(this.renderer, {
       width: "100%",
       height: "100%",
       content: "",
+      fg: CODEX_THEME.text,
+      bg: CODEX_THEME.surface,
+      wrapMode: "word",
+      selectable: false,
     });
 
     this.actionView = new TextRenderable(this.renderer, {
       width: "100%",
       height: "100%",
       content: "",
+      fg: CODEX_THEME.text,
+      bg: CODEX_THEME.surface,
+      wrapMode: "word",
+      selectable: false,
+    });
+
+    this.chatView = new TextRenderable(this.renderer, {
+      width: "100%",
+      height: CHAT_PANEL_HEIGHT,
+      content: "",
+      fg: CODEX_THEME.text,
+      bg: CODEX_THEME.surface,
+      wrapMode: "word",
+      selectable: false,
     });
 
     this.logsView = new TextRenderable(this.renderer, {
       width: "100%",
-      height: "100%",
+      flexGrow: 1,
       content: "",
+      fg: CODEX_THEME.text,
+      bg: CODEX_THEME.surface,
+      wrapMode: "word",
+      selectable: false,
     });
 
-    displayBox.add(this.battlefieldView);
+    const footerView = new TextRenderable(this.renderer, {
+      width: "100%",
+      height: 1,
+      content: "← → 切换区域  ·  ↑ ↓ 翻页  ·  / 命令  ·  : 聊天  ·  b 返回",
+      fg: CODEX_THEME.muted,
+      bg: CODEX_THEME.canvas,
+      selectable: false,
+    });
+
+    headerBox.add(this.headerView);
+    this.displayColumn.add(this.battlefieldView);
     this.actionColumn.add(this.actionView);
+    this.statusColumn.add(this.chatView);
     this.statusColumn.add(this.logsView);
-    this.displayColumn.add(displayBox);
-    rootBox.add(this.displayColumn);
-    rootBox.add(this.actionColumn);
-    rootBox.add(this.statusColumn);
+    workspaceBox.add(this.displayColumn);
+    workspaceBox.add(this.actionColumn);
+    workspaceBox.add(this.statusColumn);
+    rootBox.add(headerBox);
+    rootBox.add(workspaceBox);
+    rootBox.add(footerView);
     this.renderer.root.add(rootBox);
     this.renderer.keyInput.on("keypress", (event) => this.onKeyPress(event));
     this.updateFocusFrame();
@@ -247,10 +325,10 @@ export class CliSanGuoApp {
   }
 
   private onKeyPress(event: KeyEvent): void {
-    if (this.busy) {
+    if (this.handleCommandInput(event)) {
       return;
     }
-    if (this.handleCommandInput(event)) {
+    if (this.busy && this.mode !== "response") {
       return;
     }
     if (this.handleAreaPagingInput(event)) {
@@ -271,7 +349,7 @@ export class CliSanGuoApp {
       if (pickedResponse === null) {
         return;
       }
-      void this.handlePendingResponseChoice(pickedResponse);
+      void this.handleInteractionChoice(pickedResponse);
       return;
     }
     if (this.mode === "discard") {
@@ -359,7 +437,7 @@ export class CliSanGuoApp {
     if (!this.pendingAction) {
       return;
     }
-    if (this.shouldSelectTargetCard(this.pendingAction)) {
+    if (actionRequiresTargetCardSelection(this.pendingAction)) {
       this.pendingTargetId = targetId;
       this.targetCardOptions = this.game.getRemovableCardOptions(targetId);
       this.mode = "target-card";
@@ -404,7 +482,7 @@ export class CliSanGuoApp {
     }
     this.busy = true;
     try {
-      const logs = this.game.discardForCurrentPlayer(current.id, selected.handIndex);
+      const logs = await this.game.discardForCurrentPlayer(current.id, selected.handIndex);
       for (const line of logs) {
         this.logs.push(line);
         this.refresh();
@@ -422,8 +500,10 @@ export class CliSanGuoApp {
   }
 
   private async resolveAiTurns(): Promise<void> {
+    let actionsTaken = 0;
+    let actionsForPlayer: string | null = null;
     while (!this.game.getSnapshot().gameOver && this.game.getCurrentPlayer().isAI) {
-      const turnStateLogs = this.game.ensureTurnState();
+      const turnStateLogs = await this.game.ensureTurnState();
       if (turnStateLogs.length > 0) {
         for (const line of turnStateLogs) {
           this.logs.push(line);
@@ -433,21 +513,29 @@ export class CliSanGuoApp {
         continue;
       }
       const ai = this.game.getCurrentPlayer();
+      // 换人时重置动作计数（单个 AI 回合内累计）
+      if (actionsForPlayer !== ai.id) {
+        actionsForPlayer = ai.id;
+        actionsTaken = 0;
+      }
+      // 兜底：LLM 可能反复执行低收益动作，动作数达上限时强制收尾
+      const actionLimit = computeAiTurnActionLimit(ai.hand.length, ai.treasureCards.length);
+      if (actionsTaken >= actionLimit) {
+        this.logs.push(`[AI] ${ai.name} 回合动作已达上限（${actionLimit}），强制结束出牌`);
+        this.refresh();
+        const forcedEndAction = this.game.getPlayableActions(ai.id).find((action) => action.type === "end");
+        if (!forcedEndAction) {
+          break;
+        }
+        await this.playAndAppendLogs(ai.id, forcedEndAction, undefined, 120);
+        continue;
+      }
       const snapshot = this.game.getSnapshot();
       const previousRounds = this.getPreviousRoundPromptContexts(snapshot.turn);
       this.aiLoop.setPreviousRoundContexts(previousRounds);
       this.localAiEngine.syncPreviousRounds(previousRounds);
-      const modelDecision = this.setupAiModel === "simple" ? null : await this.aiLoop.decide(this.game, ai.id);
-      const localDecision = this.localAiEngine.decide(this.game, ai.id);
-      const fallbackDecision = localDecision
-        ? localDecision.targetId
-          ? { action: localDecision.action, targetId: localDecision.targetId }
-          : { action: localDecision.action }
-        : this.game.getBestAiDecision(ai.id);
-      const decision = modelDecision ?? fallbackDecision;
-      const driverLabel: AiDriverLabel | "本地AI" = modelDecision?.driverLabel ?? "本地AI";
-      const fallbackReason = !modelDecision && this.setupAiModel !== "simple" ? this.aiLoop.getLastFailureReason() : null;
-      const normalizedDecision = this.normalizeAiDecision(ai.id, decision);
+      const picked = await pickAiTurnDecision(this.game, ai.id, this.setupAiModel === "simple" ? null : this.aiLoop, this.localAiEngine);
+      const normalizedDecision = picked.decision;
       if (!normalizedDecision) {
         const forcedEndAction = this.game.getPlayableActions(ai.id).find((action) => action.type === "end");
         if (!forcedEndAction) {
@@ -456,90 +544,37 @@ export class CliSanGuoApp {
         await this.playAndAppendLogs(ai.id, forcedEndAction, undefined, 120);
         continue;
       }
-      if (!modelDecision && localDecision) {
-        this.logs.push(`[本地AI-预判] ${ai.name}：${localDecision.insight}`);
+      if (picked.localInsight) {
+        this.logs.push(`[本地AI-预判] ${ai.name}：${picked.localInsight}`);
       }
       const targetText = normalizedDecision.targetId ? ` -> ${this.labelPlayer(normalizedDecision.targetId)}` : "";
-      const reasonText = fallbackReason ? `（回退原因：${fallbackReason}）` : "";
-      const actionDelayMs = driverLabel === "本地AI" ? 1000 : 200;
-      this.logs.push(`[${driverLabel}] ${ai.name} 选择：${normalizedDecision.action.label}${targetText}${reasonText}`);
+      const reasonText = picked.fallbackReason ? `（回退原因：${picked.fallbackReason}）` : "";
+      const actionDelayMs = picked.driverLabel === "本地AI" ? 1000 : 200;
+      this.logs.push(`[${picked.driverLabel}] ${ai.name} 选择：${normalizedDecision.action.label}${targetText}${reasonText}`);
       this.refresh();
       await this.delay(actionDelayMs);
-      const response = this.buildPendingResponse(normalizedDecision, driverLabel);
-      if (response) {
-        if (response.targetId === "human" && response.options.length === 0) {
-          this.game.setPlayerResponsePolicy("human", { [response.responseKind]: false });
-          this.game.setPlayerResponseSelection("human", response.responseKind, null);
-          this.logs.push(`你没有可用于响应 ${response.cardName} 的手牌，自动继续结算`);
-          this.refresh();
-          await this.delay(120);
-          await this.playAndAppendLogs(ai.id, normalizedDecision.action, normalizedDecision.targetId, 200);
-          this.game.setPlayerResponseSelection("human", response.responseKind, null);
-          this.game.setPlayerResponsePolicy("human", null);
-          continue;
-        }
-        this.pendingAiResponse = response;
-        this.mode = "response";
-        this.refresh();
-        return;
-      }
       await this.playAndAppendLogs(ai.id, normalizedDecision.action, normalizedDecision.targetId, 200);
+      actionsTaken += 1;
+      // AI 回合结束：以高推理等级做一次策略博弈，后台并行执行不阻塞后续出牌
+      if (this.game.getCurrentPlayer().id !== ai.id || !this.game.getCurrentPlayer().alive) {
+        if (this.setupAiModel !== "simple") {
+          const reviewSnapshot = this.game.getSnapshot();
+          this.logs.push(`[AI] ${ai.name} 正在复盘局势...`);
+          void this.aiLoop.reviewStrategy(this.game, ai.id, reviewSnapshot).catch(() => {
+          // 后台复盘失败不影响对局
+        });
+        }
+      }
     }
     this.mode = this.game.getSnapshot().gameOver ? "gameover" : "action";
     this.refresh();
   }
 
-  private normalizeAiDecision(
-    playerId: string,
-    decision: { action: GameAction; targetId?: string } | null | undefined,
-  ): { action: GameAction; targetId?: string } | null {
-    if (!decision) {
-      return null;
-    }
-    const actions = this.game.getPlayableActions(playerId);
-    const matchedAction = actions.find((action) => this.isSameAction(action, decision.action));
-    if (!matchedAction) {
-      return null;
-    }
-    if (matchedAction.type === "end") {
-      return { action: matchedAction };
-    }
-    if (matchedAction.type !== "play" && matchedAction.type !== "skill") {
-      return { action: matchedAction };
-    }
-    if (!matchedAction.requiresTarget) {
-      return { action: matchedAction };
-    }
-    const targetId =
-      decision.targetId && matchedAction.targets.includes(decision.targetId)
-        ? decision.targetId
-        : (matchedAction.targets[0] ?? null);
-    if (!targetId) {
-      return null;
-    }
-    return { action: matchedAction, targetId };
-  }
-
-  private isSameAction(left: GameAction, right: GameAction): boolean {
-    if (left.type !== right.type) {
-      return false;
-    }
-    if (left.type === "end" && right.type === "end") {
-      return true;
-    }
-    if (left.type === "skill" && right.type === "skill") {
-      return left.skill === right.skill && left.label === right.label;
-    }
-    if (left.type === "play" && right.type === "play") {
-      return left.cardIndex === right.cardIndex && left.label === right.label;
-    }
-    return false;
-  }
-
   private refresh(): void {
-    if (!this.battlefieldView || !this.actionView || !this.logsView) {
+    if (!this.battlefieldView || !this.actionView || !this.logsView || !this.chatView) {
       return;
     }
+    this.refreshHeader();
     if (this.mode === "setup") {
       this.refreshSetupViews();
       return;
@@ -552,90 +587,36 @@ export class CliSanGuoApp {
     } else {
       this.actionOptions = [];
     }
-    const statusLines = this.buildStatusLines(snapshot);
+    const localPlayerId = snapshot.players.find((player) => !player.isAI)?.id ?? "human";
+    const statusLines = buildStatusLines(snapshot, (playerId) => this.labelPlayer(playerId), localPlayerId);
 
-    const actionLines: string[] = [];
-    actionLines.push("输入:");
-    if (this.commandBuffer !== null) {
-      actionLines.push(`命令模式: ${this.commandBuffer}`);
-      actionLines.push("回车执行，退格删除，Esc 取消");
-      actionLines.push("可用命令:");
-      actionLines.push(...this.getCommandListLines());
-    } else if (this.mode === "action") {
-      this.actionOptions.forEach((action, index) => {
-        actionLines.push(`${index + 1}. ${action.label}`);
-        const actionHint = this.getActionHint(action);
-        if (actionHint.length > 0) {
-          actionLines.push(`   功能：${actionHint}`);
-        }
-      });
-      if (this.actionOptions.length === 0) {
-        actionLines.push("等待 AI 执行...");
-      }
-    } else if (this.mode === "target") {
-      actionLines.push(`当前操作: ${this.pendingAction ? this.pendingAction.label : "选择目标"}`);
-      this.targetOptions.forEach((target, index) => {
-        actionLines.push(
-          `${index + 1}. 目标 ${target.name} | HP ${Math.max(target.hp, 0)}/${target.maxHp} | 手牌 ${target.hand.length} 张`,
-        );
-      });
-      actionLines.push("按 b 返回上一步");
-    } else if (this.mode === "target-card") {
-      const targetName = this.pendingTargetId ? this.labelPlayer(this.pendingTargetId) : "目标";
-      actionLines.push(`当前操作: ${this.pendingAction ? this.pendingAction.label : "选择牌"}`);
-      actionLines.push(`目标: ${targetName}，请选择要${this.isSnatchAction(this.pendingAction) ? "获取" : "弃置"}的牌`);
-      this.targetCardOptions.forEach((option, index) => {
-        actionLines.push(`${index + 1}. ${option.label}`);
-      });
-      if (this.targetCardOptions.length === 0) {
-        actionLines.push("目标没有可选牌，将按默认规则结算");
-        actionLines.push("1. 继续结算");
-      }
-      actionLines.push("按 b 返回上一步");
-    } else if (this.mode === "response") {
-      const responseInfo = this.pendingAiResponse;
-      actionLines.push("你受到牌效果影响，请选择应对：");
-      if (responseInfo) {
-        actionLines.push(
-          `来牌: ${responseInfo.cardName}（来自 ${this.labelPlayer(responseInfo.actorId)}，决策来源 ${responseInfo.driverLabel}）`,
-        );
-        if (responseInfo.options.length > 0) {
-          responseInfo.options.forEach((option, index) => {
-            actionLines.push(`${index + 1}. ${option.label}`);
-          });
-          actionLines.push(`${responseInfo.options.length + 1}. 不应对`);
-        } else {
-          actionLines.push("你当前没有可用应对牌。");
-          actionLines.push("1. 继续结算（不应对）");
-        }
-      }
-    } else if (this.mode === "discard") {
-      const current = snapshot.players.find((player) => player.id === snapshot.currentPlayerId);
-      if (current && current.id === "human") {
-        const needDiscard = Math.max(0, current.hand.length - current.hp);
-        actionLines.push(
-          `弃牌阶段：需弃置 ${needDiscard} 张（手牌 ${current.hand.length} / 体力 ${Math.max(current.hp, 0)}）`,
-        );
-        current.hand.forEach((card, index) => {
-          actionLines.push(`${index + 1}. 弃置 ${card.type}`);
-        });
-      } else {
-        actionLines.push("等待回合推进...");
-      }
-    } else {
-      actionLines.push("按 r 重开，或输入 /exit 退出");
-    }
-    actionLines.push("输入 / 进入命令模式");
+    const actionLines = buildActionLines({
+      commandBuffer: this.commandBuffer,
+      mode: this.mode,
+      actionOptions: this.actionOptions,
+      pendingAction: this.pendingAction,
+      targetOptions: this.targetOptions,
+      targetCardOptions: this.targetCardOptions,
+      pendingInteraction: this.pendingInteraction,
+      pendingTargetId: this.pendingTargetId,
+      snapshot,
+      labelPlayer: (playerId) => this.labelPlayer(playerId),
+      isSnatch: (action) => this.isSnatchAction(action),
+      getCommandListLines: () => this.getCommandListLines(),
+      getActionHint: (action) => getActionHint(action),
+    });
 
-    const displayPageSize = this.getBodyPageSize("display");
-    const actionPageSize = this.getBodyPageSize("action");
-    const statusPageSize = this.getBodyPageSize("status");
-    const displayLines: string[] = this.buildDisplayLines();
+    const displayPageSize = this.getBodyPageSize();
+    const actionPageSize = this.getBodyPageSize();
+    const statusPageSize = Math.max(4, this.getBodyPageSize() - CHAT_PANEL_HEIGHT - 1);
+    const displayLines: string[] = buildDisplayLines(this.logs, {
+      title: this.displayOverlayTitle,
+      lines: this.displayOverlayLines,
+    });
     if (this.displayOverlayTitle === null && this.displayFollowLatest) {
       this.displayPage = this.getMaxPage(displayLines.length, displayPageSize);
     }
     const displayViewLines = this.renderPagedArea({
-      title: "显示区",
       lines: displayLines,
       page: this.displayPage,
       pageSize: displayPageSize,
@@ -644,7 +625,6 @@ export class CliSanGuoApp {
     this.displayPage = displayViewLines.page;
 
     const actionViewLines = this.renderPagedArea({
-      title: "操作区",
       lines: actionLines,
       page: this.actionPage,
       pageSize: actionPageSize,
@@ -653,7 +633,6 @@ export class CliSanGuoApp {
     this.actionPage = actionViewLines.page;
 
     const statusViewLines = this.renderPagedArea({
-      title: "战场状态",
       lines: statusLines,
       page: this.statusPage,
       pageSize: statusPageSize,
@@ -663,113 +642,32 @@ export class CliSanGuoApp {
 
     this.battlefieldView.content = displayViewLines.lines.join("\n");
     this.actionView.content = actionViewLines.lines.join("\n");
+    this.chatView.content = buildChatLines(this.chatMessages).join("\n");
     this.logsView.content = statusViewLines.lines.join("\n");
   }
 
-  private buildDisplayLines(): string[] {
-    if (this.displayOverlayTitle !== null) {
-      const lines: string[] = [];
-      lines.push(`【${this.displayOverlayTitle}】`);
-      lines.push("输入 /close 关闭当前文档");
-      lines.push("");
-      lines.push(...this.displayOverlayLines);
-      return lines;
+  private refreshHeader(): void {
+    if (!this.headerView) {
+      return;
     }
-    const lines: string[] = [];
-    lines.push("输入“/”进入命令模式，建议先用 /help 查看帮助文档");
-    lines.push("");
-    lines.push("最近记录:");
-    const latest = this.logs.slice(-100);
-    for (const item of latest) {
-      lines.push(`- ${item}`);
-    }
-    return lines;
-  }
-
-  private buildStatusLines(snapshot: ReturnType<SanGuoGame["getSnapshot"]>): string[] {
-    const statusLines: string[] = [];
-    statusLines.push(`回合: ${snapshot.turn}`);
-    statusLines.push(`当前玩家: ${this.labelPlayer(snapshot.currentPlayerId)}`);
-    statusLines.push(`阶段: ${snapshot.phase}`);
-    statusLines.push(`牌堆: ${snapshot.deckCount}  弃牌堆: ${snapshot.discardCount}`);
-    statusLines.push("");
-    statusLines.push("玩家状态:");
-    for (const player of snapshot.players) {
-      const status = player.alive ? "存活" : "阵亡";
-      const identity = !player.alive ? player.role : player.role === PlayerRole.Lord ? PlayerRole.Lord : "未知";
-      const hand = player.isAI ? `${player.hand.length} 张` : this.describeHand(player.hand);
-      const skills = player.skills.length > 0 ? player.skills.join("、") : "无";
-      const weapon = player.weapon ?? "无";
-      const armor = player.armor ?? "无";
-      const attackHorse = player.attackHorse ?? "无";
-      const defenseHorse = player.defenseHorse ?? "无";
-      const treasure = player.treasure ?? "无";
-      statusLines.push(
-        `- ${player.name}[${player.general}] | 身份 ${identity} | HP ${Math.max(player.hp, 0)}/${player.maxHp} | 手牌 ${hand} | 装备 武器:${weapon} 防具:${armor} +1马:${defenseHorse} -1马:${attackHorse} 宝物:${treasure} | 技能 ${skills} | ${status}`,
-      );
-    }
-    if (snapshot.gameOver) {
-      statusLines.push("");
-      if (snapshot.winner === "human") {
-        statusLines.push("结果: 主公获胜");
-      } else if (snapshot.winner === "ai") {
-        statusLines.push("结果: 反贼获胜");
-      } else {
-        statusLines.push("结果: 平局");
-      }
-    }
-    return statusLines;
-  }
-
-  private toPromptBattlefieldLine(player: Player): string {
-    const equipments = `${player.weapon ?? "无"}/${player.armor ?? "无"}/${player.attackHorse ?? "无"}/${player.defenseHorse ?? "无"}/${player.treasure ?? "无"}`;
-    return `${player.name}(${player.id})|身份:${player.role}|武将:${player.general}|体力:${Math.max(player.hp, 0)}/${player.maxHp}|手牌:${player.hand.length}|装备:${equipments}|状态:${player.alive ? "存活" : "阵亡"}`;
+    const session = this.mode === "setup" ? "setup" : this.game.getSnapshot().gameOver ? "complete" : "local match";
+    const model = this.getAiModelLabel(this.setupAiModel);
+    this.headerView.content = t`${bold(fg(CODEX_THEME.accent)("› 三国杀 · AI 对战终端"))}\n${fg(CODEX_THEME.muted)(`  session: ${session}  ·  players: ${this.setupPlayerCount}  ·  model: ${model}`)}`;
   }
 
   private syncCurrentRoundBattlefield(snapshot: ReturnType<SanGuoGame["getSnapshot"]>): void {
-    const lines = snapshot.players.map((player) => this.toPromptBattlefieldLine(player));
-    this.roundBattlefieldHistory.set(snapshot.turn, lines);
-    if (this.roundBattlefieldHistory.size <= 20) {
-      return;
-    }
-    const rounds = Array.from(this.roundBattlefieldHistory.keys()).sort((a, b) => a - b);
-    const toDelete = rounds.slice(0, rounds.length - 20);
-    for (const round of toDelete) {
-      this.roundBattlefieldHistory.delete(round);
-    }
+    trackRoundBattlefield(this.roundBattlefieldHistory, snapshot.turn, buildBattlefieldLines(snapshot.players), this.maxContextRounds);
   }
 
   private getPreviousRoundPromptContexts(currentRound: number): RoundPromptContext[] {
-    const roundLogs = new Map<number, string[]>();
-    let activeRound: number | null = null;
-    for (const line of this.logs) {
-      const matched = line.match(/^第\s*(\d+)\s*(?:回合|轮)[:：]/);
-      if (matched?.[1]) {
-        activeRound = Number.parseInt(matched[1], 10);
-      }
-      if (activeRound === null || Number.isNaN(activeRound)) {
-        continue;
-      }
-      if (!roundLogs.has(activeRound)) {
-        roundLogs.set(activeRound, []);
-      }
-      roundLogs.get(activeRound)?.push(line);
-    }
-    const rounds = Array.from(roundLogs.keys())
-      .filter((round) => round < currentRound)
-      .sort((a, b) => a - b)
-      .slice(-3);
-    return rounds.map((round) => ({
-      round,
-      displayLines: roundLogs.get(round) ?? [],
-      battlefieldLines: this.roundBattlefieldHistory.get(round) ?? [],
-    }));
+    return buildRoundContexts(this.logs, this.roundBattlefieldHistory, currentRound, this.maxContextRounds);
   }
 
   private restart(): void {
     this.aiLoop.stop();
     this.localAiEngine.reset();
     this.logs = [];
+    this.chatMessages = [];
     this.pendingAction = null;
     this.pendingTargetId = null;
     this.targetCardOptions = [];
@@ -795,13 +693,6 @@ export class CliSanGuoApp {
   private labelPlayer(playerId: string): string {
     const player = this.game.getSnapshot().players.find((item) => item.id === playerId);
     return player ? player.name : playerId;
-  }
-
-  private describeHand(cards: Player["hand"]): string {
-    if (cards.length === 0) {
-      return "0 张";
-    }
-    return cards.map((card, index) => `${index + 1}:${card.type}`).join(" ");
   }
 
   private toOptionIndex(event: KeyEvent): number | null {
@@ -845,8 +736,8 @@ export class CliSanGuoApp {
       return true;
     }
     const start = this.toCommandChar(event);
-    if (start === "/") {
-      this.commandBuffer = "/";
+    if (start === "/" || start === ":" || start === "：") {
+      this.commandBuffer = start;
       this.refresh();
       return true;
     }
@@ -854,6 +745,10 @@ export class CliSanGuoApp {
   }
 
   private executeCommand(command: string): void {
+    if (command.startsWith(":") || command.startsWith("：")) {
+      this.addChatMessage(command.slice(1));
+      return;
+    }
     if (command === "/help") {
       this.openDisplayOverlay("完整规则", this.rulesLines);
       return;
@@ -884,11 +779,28 @@ export class CliSanGuoApp {
 
   private getCommandListLines(): string[] {
     return [
-      "- /help 查看完整规则文档",
-      "- /rules 查看完整规则文档（同 /help）",
-      "- /close 关闭当前文档",
-      "- /exit 退出游戏",
+      "  :内容    发送聊天到右上角",
+      "  /help    查看完整规则文档",
+      "  /rules   查看完整规则文档",
+      "  /close   关闭当前文档",
+      "  /exit    退出游戏",
     ];
+  }
+
+  private addChatMessage(rawContent: string): void {
+    const normalized = rawContent.replace(/\s+/g, " ").trim();
+    if (normalized.length === 0) {
+      this.logs.push("聊天内容不能为空");
+      return;
+    }
+    const content = Array.from(normalized).slice(0, MAX_CHAT_LENGTH).join("");
+    const sender = this.mode === "setup"
+      ? this.options.initOptions.humanName ?? "你"
+      : this.game.getSnapshot().players.find((player) => !player.isAI)?.name ?? "你";
+    this.chatMessages.push({ sender, content });
+    if (this.chatMessages.length > MAX_CHAT_MESSAGES) {
+      this.chatMessages.splice(0, this.chatMessages.length - MAX_CHAT_MESSAGES);
+    }
   }
 
   private loadRulesLines(): string[] {
@@ -905,8 +817,9 @@ export class CliSanGuoApp {
     const preferredCountSource = this.options.initOptions.playerCount ?? (this.options.initOptions.aiCount ?? 2) + 1;
     this.setupPlayerCount = Math.min(6, Math.max(2, Math.floor(preferredCountSource)));
     this.setupRole = PlayerRole.Lord;
-    this.setupKingdom = "吴";
-    this.setupGeneralName = this.getGeneralsByKingdom(this.setupKingdom)[0]?.name ?? (this.generalLibrary[0]?.name ?? "孙策");
+    this.setupGeneralName = "待选择";
+    this.setupGeneralCandidates = [];
+    this.setupGeneralAssignments = {};
     this.setupAiModel = "qwen";
     this.setupOllamaModel = "gemma4:latest";
     this.setupOllamaModels = [];
@@ -930,67 +843,68 @@ export class CliSanGuoApp {
     const usingOllama = this.setupAiModel === "ollama";
     const stageTitle =
       this.setupStage === "player-count"
-        ? "步骤1/6：选择游玩人数"
+        ? "步骤1/5：选择游玩人数"
         : this.setupStage === "role"
-          ? "步骤2/6：选择身份"
-          : this.setupStage === "kingdom"
-            ? "步骤3/6：选择势力"
+          ? "步骤2/5：选择身份"
           : this.setupStage === "general"
-              ? "步骤4/6：选择武将"
+              ? `步骤3/5：从 ${this.setupRole === PlayerRole.Lord ? 5 : 3} 名候选中选择武将`
               : this.setupStage === "ai-model"
-                ? "步骤5/6：选择默认AI模型"
+                ? "步骤4/5：选择默认AI模型"
                 : this.setupStage === "ollama-model"
-                  ? "步骤6/7：选择Ollama模型"
+                  ? "步骤5/6：选择Ollama模型"
                   : usingOllama
-                    ? "步骤7/7：开始游戏"
-                    : "步骤6/6：开始游戏";
+                    ? "步骤6/6：开始游戏"
+                    : "步骤5/5：开始游戏";
     const leftLines: string[] = [];
     if (this.setupStage === "player-count") {
-      leftLines.push("请在操作区选择游玩人数");
-    } else {
-      leftLines.push("输入“/”进入命令模式，建议先用 /help 查看帮助文档");
+      leftLines.push("› 创建一场本地对局");
       leftLines.push("");
-      leftLines.push("开局配置");
+      leftLines.push("从右侧选择游玩人数，随后配置身份、武将与 AI。");
+    } else {
+      leftLines.push("› 对局配置");
+      leftLines.push("");
       leftLines.push(stageTitle);
       leftLines.push("");
-      leftLines.push(`- 游玩人数: ${this.setupPlayerCount}`);
-      leftLines.push(`- 默认配比: ${this.getRoleDistributionText(this.setupPlayerCount)}`);
-      leftLines.push(`- 我的身份: ${this.setupRole}`);
-      leftLines.push(`- 势力: ${this.setupKingdom}`);
-      leftLines.push(`- 我的武将: ${this.setupGeneralName}`);
-      leftLines.push(`- 默认AI模型: ${this.getAiModelLabel(this.setupAiModel)}`);
+      leftLines.push(`  players:  ${this.setupPlayerCount}`);
+      leftLines.push(`  roles:    ${this.getRoleDistributionText(this.setupPlayerCount)}`);
+      leftLines.push(`  identity: ${this.setupRole}`);
+      leftLines.push(`  kingdom:  ${this.generalLibrary.find((general) => general.name === this.setupGeneralName)?.kingdom ?? "待选择"}`);
+      leftLines.push(`  general:  ${this.setupGeneralName}`);
+      leftLines.push(`  model:    ${this.getAiModelLabel(this.setupAiModel)}`);
       if (this.setupAiModel === "ollama") {
-        leftLines.push(`- Ollama具体模型: ${this.setupOllamaModel}`);
+        leftLines.push(`  ollama:   ${this.setupOllamaModel}`);
       }
       leftLines.push("");
-      leftLines.push("按 b 返回上一步");
+      leftLines.push("b 返回上一步");
     }
 
     const actionLines: string[] = [];
-    actionLines.push("输入:");
     if (this.commandBuffer !== null) {
-      actionLines.push(`命令模式: ${this.commandBuffer}`);
-      actionLines.push("回车执行，退格删除，Esc 取消");
-      actionLines.push("可用命令:");
+      actionLines.push(`› ${this.commandBuffer}`);
+      actionLines.push("  Enter 执行 · Esc 取消");
+      actionLines.push("");
+      actionLines.push("commands");
       actionLines.push(...this.getCommandListLines());
     } else {
       const options = this.getSetupOptions();
       options.forEach((label, index) => {
-        actionLines.push(`${index + 1}. ${label}`);
+        actionLines.push(`  ${index + 1}  ${label}`);
       });
       if (this.setupStage === "ollama-model" && this.setupOllamaLoadError) {
         actionLines.push(`读取失败：${this.setupOllamaLoadError}`);
       }
-      actionLines.push("输入 / 进入命令模式");
+      actionLines.push("");
+      actionLines.push("› 输入编号 · / 打开命令 · : 输入聊天");
     }
 
-    const rightLines: string[] = ["战场将在开始游戏后显示"];
-    const displayPageSize = this.getBodyPageSize("display");
-    const actionPageSize = this.getBodyPageSize("action");
-    const statusPageSize = this.getBodyPageSize("status");
-    const displaySource = this.displayOverlayTitle ? this.buildDisplayLines() : leftLines;
+    const rightLines: string[] = ["waiting", "", "战场将在开始游戏后显示。"];
+    const displayPageSize = this.getBodyPageSize();
+    const actionPageSize = this.getBodyPageSize();
+    const statusPageSize = Math.max(4, this.getBodyPageSize() - CHAT_PANEL_HEIGHT - 1);
+    const displaySource = this.displayOverlayTitle
+      ? buildDisplayLines(this.logs, { title: this.displayOverlayTitle, lines: this.displayOverlayLines })
+      : leftLines;
     const displayViewLines = this.renderPagedArea({
-      title: "显示区",
       lines: displaySource,
       page: this.displayPage,
       pageSize: displayPageSize,
@@ -998,7 +912,6 @@ export class CliSanGuoApp {
     });
     this.displayPage = displayViewLines.page;
     const actionViewLines = this.renderPagedArea({
-      title: "操作区",
       lines: actionLines,
       page: this.actionPage,
       pageSize: actionPageSize,
@@ -1006,7 +919,6 @@ export class CliSanGuoApp {
     });
     this.actionPage = actionViewLines.page;
     const statusViewLines = this.renderPagedArea({
-      title: "战场状态",
       lines: rightLines,
       page: this.statusPage,
       pageSize: statusPageSize,
@@ -1016,6 +928,9 @@ export class CliSanGuoApp {
 
     this.battlefieldView.content = displayViewLines.lines.join("\n");
     this.actionView.content = actionViewLines.lines.join("\n");
+    if (this.chatView) {
+      this.chatView.content = buildChatLines(this.chatMessages).join("\n");
+    }
     this.logsView.content = statusViewLines.lines.join("\n");
   }
 
@@ -1023,10 +938,8 @@ export class CliSanGuoApp {
     if (this.setupStage !== "player-count" && event.name === "b") {
       if (this.setupStage === "role") {
         this.setupStage = "player-count";
-      } else if (this.setupStage === "kingdom") {
-        this.setupStage = "role";
       } else if (this.setupStage === "general") {
-        this.setupStage = "kingdom";
+        this.setupStage = "role";
       } else if (this.setupStage === "ai-model") {
         this.setupStage = "general";
       } else if (this.setupStage === "ollama-model") {
@@ -1063,26 +976,13 @@ export class CliSanGuoApp {
         return;
       }
       this.setupRole = role;
-      this.setupStage = "kingdom";
-      this.refresh();
-      return;
-    }
-    if (this.setupStage === "kingdom") {
-      const kingdoms = this.getKingdomOptions();
-      const kingdom = kingdoms[picked];
-      if (!kingdom) {
-        return;
-      }
-      this.setupKingdom = kingdom;
-      const generalsInKingdom = this.getGeneralsByKingdom(kingdom);
-      this.setupGeneralName = generalsInKingdom[0]?.name ?? this.setupGeneralName;
+      this.prepareGeneralDraft();
       this.setupStage = "general";
       this.refresh();
       return;
     }
     if (this.setupStage === "general") {
-      const generals = this.getGeneralsByKingdom(this.setupKingdom);
-      const pickedGeneral = generals[picked];
+      const pickedGeneral = this.setupGeneralCandidates[picked];
       if (!pickedGeneral) {
         return;
       }
@@ -1131,7 +1031,7 @@ export class CliSanGuoApp {
       return;
     }
     if (this.setupStage === "start" && picked === 0) {
-      this.startConfiguredGame();
+      void this.startConfiguredGame();
     }
   }
 
@@ -1142,11 +1042,8 @@ export class CliSanGuoApp {
     if (this.setupStage === "role") {
       return this.getRoleOptions();
     }
-    if (this.setupStage === "kingdom") {
-      return this.getKingdomOptions();
-    }
     if (this.setupStage === "general") {
-      return this.getGeneralsByKingdom(this.setupKingdom).map((general) => {
+      return this.setupGeneralCandidates.map((general) => {
         const skills = general.skills.length > 0 ? general.skills.join("、") : "无技能";
         return `${general.name}[${general.kingdom}] ${general.maxHp}体力（${skills}）`;
       });
@@ -1209,12 +1106,21 @@ export class CliSanGuoApp {
     return [PlayerRole.Lord, PlayerRole.Loyalist, PlayerRole.Rebel, PlayerRole.Traitor];
   }
 
-  private getKingdomOptions(): Kingdom[] {
-    return ["魏", "蜀", "吴", "群雄"];
-  }
-
-  private getGeneralsByKingdom(kingdom: Kingdom): typeof this.generalLibrary {
-    return this.generalLibrary.filter((general) => general.kingdom === kingdom);
+  private prepareGeneralDraft(): void {
+    const draft = this.game.createDefaultGeneralDraft(this.setupPlayerCount, this.setupRole);
+    const humanSeat = draft.find((seat) => seat.playerId === "human");
+    this.setupGeneralCandidates = humanSeat?.candidates ?? [];
+    this.setupGeneralName = this.setupGeneralCandidates[0]?.name ?? (this.generalLibrary[0]?.name ?? "孙策");
+    this.setupGeneralAssignments = {};
+    for (const seat of draft) {
+      if (seat.playerId === "human") {
+        continue;
+      }
+      const selected = seat.candidates[0];
+      if (selected) {
+        this.setupGeneralAssignments[seat.playerId] = selected.name;
+      }
+    }
   }
 
   private getAiModelOptions(): SetupAiModel[] {
@@ -1244,7 +1150,7 @@ export class CliSanGuoApp {
     return "反贼3 忠臣1 内奸1";
   }
 
-  private startConfiguredGame(): void {
+  private async startConfiguredGame(): Promise<void> {
     this.aiLoop.stop();
     this.localAiEngine.reset();
     if (this.setupAiModel === "ollama" || this.setupAiModel === "qwen") {
@@ -1256,7 +1162,7 @@ export class CliSanGuoApp {
     }
     this.logs = [];
     this.pendingAction = null;
-    this.pendingAiResponse = null;
+    this.pendingInteraction = null;
     this.pendingTargetId = null;
     this.targetCardOptions = [];
     this.targetOptions = [];
@@ -1267,15 +1173,15 @@ export class CliSanGuoApp {
     this.displayPage = 0;
     this.actionPage = 0;
     this.statusPage = 0;
-    this.logs.push(
-      ...this.game.initDefaultGame({
-        ...this.options.initOptions,
-        playerCount: this.setupPlayerCount,
-        aiCount: this.setupPlayerCount - 1,
-        humanRole: this.setupRole,
-        humanGeneral: this.setupGeneralName,
-      }),
-    );
+    const initLogs = await this.game.initDefaultGame({
+      ...this.options.initOptions,
+      playerCount: this.setupPlayerCount,
+      aiCount: this.setupPlayerCount - 1,
+      humanRole: this.setupRole,
+      humanGeneral: this.setupGeneralName,
+      generalAssignments: this.setupGeneralAssignments,
+    }, false);
+    this.logs.push(...initLogs);
     const subAgentCount = this.aiLoop.start(this.game.getSnapshot());
     const providerText =
       this.setupAiModel === "ollama"
@@ -1289,7 +1195,30 @@ export class CliSanGuoApp {
     } else {
       void this.logAiLoopStatus();
     }
+    this.game.setDecisionHandler("human", (request) => {
+      return new Promise<InteractionDecision>((resolve) => {
+        this.pendingInteraction = { request, resolve };
+        this.mode = "response";
+        this.refresh();
+      });
+    });
+    // 所有 AI 驱动都必须处理选牌与可选技能；纯概率花色选择仍交给引擎。
+    for (const player of this.game.getSnapshot().players) {
+      if (!player.isAI) {
+        continue;
+      }
+      const aiId = player.id;
+      this.game.setDecisionHandler(aiId, async (request) => {
+        if (request.kind === "choose-suit") {
+          return null;
+        }
+        return this.setupAiModel === "simple"
+          ? this.localAiEngine.decideInteraction(this.game, aiId, request)
+          : this.aiLoop.decideInteraction(this.game, aiId, request);
+      });
+    }
     this.mode = "action";
+    this.logs.push(...(await this.game.startTurn()));
     void this.resolveAiTurns();
     this.refresh();
   }
@@ -1314,7 +1243,7 @@ export class CliSanGuoApp {
   ): Promise<void> {
     this.busy = true;
     try {
-      const logs = this.game.playAction(playerId, action, targetId, selectedCardId);
+      const logs = await this.game.playAction(playerId, action, targetId, selectedCardId);
       const stepDelay = delayMs ?? (playerId === "human" ? 100 : 200);
       for (const line of logs) {
         this.logs.push(line);
@@ -1326,285 +1255,55 @@ export class CliSanGuoApp {
     }
   }
 
-  private async handlePendingResponseChoice(picked: number): Promise<void> {
-    const pending = this.pendingAiResponse;
+    private async handleInteractionChoice(picked: number): Promise<void> {
+    const pending = this.pendingInteraction;
     if (!pending) {
       this.mode = "action";
       this.refresh();
       return;
     }
-    const optionCount = pending.options.length;
-    if ((optionCount > 0 && picked > optionCount) || (optionCount === 0 && picked > 0)) {
-      return;
-    }
-    const chooseNoResponse = optionCount > 0 ? picked === optionCount : picked === 0;
-    if (chooseNoResponse) {
-      this.game.setPlayerResponsePolicy("human", { [pending.responseKind]: false });
-      this.game.setPlayerResponseSelection("human", pending.responseKind, null);
-      this.logs.push(`你选择不响应 ${pending.cardName}`);
-      this.refresh();
-      await this.delay(100);
-    } else {
-      const selected = pending.options[picked];
-      if (!selected) {
-        return;
-      }
-      this.game.setPlayerResponsePolicy("human", { [pending.responseKind]: true });
-      this.game.setPlayerResponseSelection("human", pending.responseKind, selected.id);
-      this.logs.push(`你选择：${selected.label}`);
-      this.refresh();
-      await this.delay(100);
-    }
-    this.pendingAiResponse = null;
+    const { request, resolve } = pending;
+    this.pendingInteraction = null;
+    const decision = this.buildInteractionDecision(request, picked);
     this.mode = "action";
-    await this.playAndAppendLogs(pending.actorId, pending.action, pending.targetId, 200);
-    this.game.setPlayerResponseSelection("human", pending.responseKind, null);
-    this.game.setPlayerResponsePolicy("human", null);
+    this.refresh();
+    await this.delay(50);
+    resolve(decision);
     await this.resolveAiTurns();
   }
 
-  private buildPendingResponse(
-    decision: { action: GameAction; targetId?: string },
-    driverLabel: AiDriverLabel | "本地AI",
-  ): PendingAiResponse | null {
-    if (decision.action.type !== "play") {
-      return null;
+  private buildInteractionDecision(request: InteractionRequest, picked: number): InteractionDecision {
+    if (request.kind === "respond") {
+      const source = request.sources[picked];
+      return source ? { choice: "card", sourceId: source.sourceId } : { choice: "pass" };
     }
-    const actorId = this.game.getCurrentPlayer().id;
-    const cardByIndex =
-      decision.action.cardIndex >= 0
-        ? this.game
-            .getSnapshot()
-            .players.find((player) => player.id === actorId)
-            ?.hand[decision.action.cardIndex]?.type
-        : null;
-    const cardName = cardByIndex ?? this.extractCardTypeFromAction(decision.action);
-    if (!cardName) {
-      return null;
-    }
-    const humanAlive = this.game.getSnapshot().players.some((player) => player.id === "human" && player.alive);
-    if (!humanAlive) {
-      return null;
-    }
-    const humanDirectTarget = decision.targetId === "human";
-    if (cardName === CardType.Slash) {
-      if (!humanDirectTarget) {
-        return null;
+    if (request.kind === "collateral") {
+      const victimId = request.victims[picked];
+      if (!victimId) {
+        return { choice: "pass" };
       }
-      const options = this.game.getPlayerResponseOptions("human", "dodge");
-      const targetId = decision.targetId;
-      if (!targetId) {
-        return null;
-      }
-      return {
-        actorId: this.game.getCurrentPlayer().id,
-        action: decision.action,
-        targetId,
-        responseKind: "dodge",
-        cardName,
-        options,
-        driverLabel,
-      };
+      const firstSlash = request.sources[0];
+      return { choice: "target", targetId: victimId, ...(firstSlash ? { sourceId: firstSlash.sourceId } : {}) };
     }
-    if (cardName === CardType.Duel) {
-      if (!humanDirectTarget) {
-        return null;
-      }
-      const options = this.game.getPlayerResponseOptions("human", "slash");
-      const targetId = decision.targetId;
-      if (!targetId) {
-        return null;
-      }
-      return {
-        actorId,
-        action: decision.action,
-        targetId,
-        responseKind: "slash",
-        cardName,
-        options,
-        driverLabel,
-      };
+    if (request.kind === "choose-discard" || request.kind === "choose-card") {
+      const source = request.sources[picked];
+      return source ? { choice: "card", sourceId: source.sourceId } : { choice: "pass" };
     }
-    if (cardName === CardType.Dismantle || cardName === CardType.Snatch || cardName === CardType.Collateral) {
-      if (!humanDirectTarget) {
-        return null;
-      }
-      const options = this.game.getPlayerResponseOptions("human", "negate");
-      const targetId = decision.targetId;
-      if (!targetId) {
-        return null;
-      }
-      return {
-        actorId,
-        action: decision.action,
-        targetId,
-        responseKind: "negate",
-        cardName,
-        options,
-        driverLabel,
-      };
+    if (request.kind === "choose-suit") {
+      const suit = request.suits[picked] ?? request.suits[0] ?? "heart";
+      return { choice: "suit", suit };
     }
-    if (cardName === CardType.Barbarian) {
-      const options = this.game.getPlayerResponseOptions("human", "slash");
-      return {
-        actorId,
-        action: decision.action,
-        responseKind: "slash",
-        cardName,
-        options,
-        driverLabel,
-      };
+    if (request.kind === "optional-effect") {
+      return { choice: "effect", enabled: picked === 0 };
     }
-    if (cardName === CardType.ArrowRain) {
-      const options = this.game.getPlayerResponseOptions("human", "dodge");
-      return {
-        actorId,
-        action: decision.action,
-        responseKind: "dodge",
-        cardName,
-        options,
-        driverLabel,
-      };
-    }
-    return null;
-  }
-
-  private extractCardTypeFromAction(action: Extract<GameAction, { type: "play" }>): CardType | null {
-    const label = action.label;
-    const allCardTypes = Object.values(CardType);
-    const picked = allCardTypes.find((cardType) => label.includes(cardType));
-    return picked ?? null;
-  }
-
-  private shouldSelectTargetCard(action: TargetAction): boolean {
-    if (action.type !== "play") {
-      return false;
-    }
-    const cardType = this.extractCardTypeFromAction(action);
-    return cardType === CardType.Dismantle || cardType === CardType.Snatch;
+    return { choice: "pass" };
   }
 
   private isSnatchAction(action: TargetAction | null): boolean {
     if (!action || action.type !== "play") {
       return false;
     }
-    return this.extractCardTypeFromAction(action) === CardType.Snatch;
-  }
-
-  private getActionHint(action: GameAction): string {
-    if (action.type === "end") {
-      return "结束当前出牌阶段并进入弃牌/结算流程";
-    }
-    if (action.type === "skill") {
-      if (action.label.includes("强袭")) {
-        return "弃1张牌并对1名目标造成1点伤害（每回合限一次）";
-      }
-      if (action.label.includes("制衡")) {
-        return "弃任意张牌并摸等量牌（每回合限一次）";
-      }
-      if (action.label.includes("青囊")) {
-        return "弃1张手牌令1名角色回复1点体力（每回合限一次）";
-      }
-      if (action.label.includes("苦肉")) {
-        return "失去1点体力并摸2张牌";
-      }
-      return "发动武将技能获得额外收益";
-    }
-    if (action.label.includes("木牛流马下的")) {
-      return "从木牛流马中打出寄存牌，并按该牌原效果结算";
-    }
-    const cardType = this.extractCardTypeFromAction(action);
-    if (!cardType) {
-      return action.requiresTarget ? "使用此牌并选择目标" : "使用此牌立即生效";
-    }
-    if (cardType === CardType.Slash) {
-      return "对1名角色造成1点伤害（可被闪抵消）";
-    }
-    if (cardType === CardType.Peach) {
-      return "回复1点体力";
-    }
-    if (cardType === CardType.Duel) {
-      return "与你指定目标轮流打出杀，先断者受1点伤害";
-    }
-    if (cardType === CardType.Dismantle) {
-      return "弃置目标区域内1张牌";
-    }
-    if (cardType === CardType.Snatch) {
-      return "获得目标区域内1张牌";
-    }
-    if (cardType === CardType.ExNihilo) {
-      return "摸2张牌";
-    }
-    if (cardType === CardType.PeachGarden) {
-      return "所有存活角色各回复1点体力";
-    }
-    if (cardType === CardType.Harvest) {
-      return "所有存活角色各摸1张牌";
-    }
-    if (cardType === CardType.Barbarian) {
-      return "其他角色需打出杀，否则受到1点伤害";
-    }
-    if (cardType === CardType.ArrowRain) {
-      return "其他角色需打出闪，否则受到1点伤害";
-    }
-    if (cardType === CardType.Collateral) {
-      return "指定装备武器角色对其攻击范围内目标出杀，否则其武器被弃置";
-    }
-    if (cardType === CardType.Negate) {
-      return "抵消一张锦囊牌对单个目标的生效";
-    }
-    if (cardType === CardType.Crossbow) {
-      return "武器：攻击范围2，出牌阶段可无限次使用杀";
-    }
-    if (cardType === CardType.FemaleSword) {
-      return "武器：攻击范围2；异性目标响应杀后，随机弃其1手牌或你摸1张";
-    }
-    if (cardType === CardType.QinggangSword) {
-      return "武器：攻击范围2；你使用的杀无视目标防具";
-    }
-    if (cardType === CardType.IceSword) {
-      return "武器：攻击范围2；杀将造成伤害时可改为弃目标2张牌";
-    }
-    if (cardType === CardType.GudingBlade) {
-      return "武器：攻击范围2；目标无手牌时，你的杀伤害+1";
-    }
-    if (cardType === CardType.SerpentSpear) {
-      return "武器：攻击范围3；可弃2张手牌当1张杀使用";
-    }
-    if (cardType === CardType.GreenDragonBlade) {
-      return "武器：攻击范围3；杀被闪后可追加再出1张杀";
-    }
-    if (cardType === CardType.RockCleavingAxe) {
-      return "武器：攻击范围3；杀被闪后可弃2张牌令此杀仍命中";
-    }
-    if (cardType === CardType.Halberd) {
-      return "武器：攻击范围4；最后一张手牌为杀时可额外指定至多2个目标";
-    }
-    if (cardType === CardType.KylinBow) {
-      return "武器：攻击范围5；杀造成伤害后可弃置目标坐骑";
-    }
-    if (cardType === CardType.EightDiagram) {
-      return "防具：受杀时有概率视为自动打出闪";
-    }
-    if (cardType === CardType.RenwangShield) {
-      return "防具：黑色杀对你无效";
-    }
-    if (cardType === CardType.VineArmor) {
-      return "防具：普通杀、南蛮入侵、万箭齐发对你无效";
-    }
-    if (cardType === CardType.SilverLion) {
-      return "防具：受到超过1点伤害时改为1点；失去此防具时回复1点体力";
-    }
-    if (cardType === CardType.Dilu || cardType === CardType.JueYing || cardType === CardType.ZhuaHuangFeiDian) {
-      return "防御马：其他角色计算到你的距离+1，更不容易被指定为目标";
-    }
-    if (cardType === CardType.ChiTu || cardType === CardType.DaYuan || cardType === CardType.ZiXing) {
-      return "进攻马：你计算到其他角色的距离-1，更容易命中远处目标";
-    }
-    if (cardType === CardType.WoodenOx) {
-      return "宝物：可寄存手牌并转移给其他角色，也可直接使用寄存牌";
-    }
-    return action.requiresTarget ? "使用装备或锦囊并选择目标" : "使用装备牌并立即生效";
+    return extractCardTypeFromAction(action) === CardType.Snatch;
   }
 
   private delay(ms: number): Promise<void> {
@@ -1626,7 +1325,6 @@ export class CliSanGuoApp {
   }
 
   private renderPagedArea(input: {
-    title: string;
     lines: string[];
     page: number;
     pageSize: number;
@@ -1641,15 +1339,15 @@ export class CliSanGuoApp {
       body.push("");
     }
     const output: string[] = [];
-    const hint = input.focused ? " | ←→切区 ↑↓翻页" : "";
-    output.push(`${input.title}（${page + 1}/${totalPages}）${hint}`);
+    const hint = input.focused ? "›" : " ";
+    output.push(`${hint} page ${page + 1}/${totalPages}${input.focused ? " · ↑↓ 翻页" : ""}`);
     output.push(...body);
     return { lines: output, page, totalPages };
   }
 
-  private getBodyPageSize(area: FocusArea): number {
+  private getBodyPageSize(): number {
     const rows = process.stdout.rows ?? 40;
-    const reserved = area === "display" ? 7 : 6;
+    const reserved = 14;
     const pageSize = rows - reserved;
     return Math.max(4, pageSize);
   }
@@ -1699,8 +1397,11 @@ export class CliSanGuoApp {
 
   private changeFocusedPage(step: -1 | 1): void {
     if (this.focusArea === "display") {
-      const displayLines = this.buildDisplayLines();
-      const displayPageSize = this.getBodyPageSize("display");
+      const displayLines = buildDisplayLines(this.logs, {
+        title: this.displayOverlayTitle,
+        lines: this.displayOverlayLines,
+      });
+      const displayPageSize = this.getBodyPageSize();
       const maxPage = this.getMaxPage(displayLines.length, displayPageSize);
       const nextPage = Math.min(Math.max(this.displayPage + step, 0), maxPage);
       this.displayPage = nextPage;
@@ -1720,19 +1421,36 @@ export class CliSanGuoApp {
     if (!this.displayColumn || !this.actionColumn || !this.statusColumn) {
       return;
     }
-    this.displayColumn.borderColor = this.focusArea === "display" ? "green" : "white";
-    this.actionColumn.borderColor = this.focusArea === "action" ? "green" : "white";
-    this.statusColumn.borderColor = this.focusArea === "status" ? "green" : "white";
+    this.displayColumn.borderColor = this.focusArea === "display" ? CODEX_THEME.accent : CODEX_THEME.border;
+    this.actionColumn.borderColor = this.focusArea === "action" ? CODEX_THEME.accent : CODEX_THEME.border;
+    this.statusColumn.borderColor = this.focusArea === "status" ? CODEX_THEME.accent : CODEX_THEME.border;
+    this.displayColumn.backgroundColor = this.focusArea === "display" ? CODEX_THEME.surfaceFocused : CODEX_THEME.surface;
+    this.actionColumn.backgroundColor = this.focusArea === "action" ? CODEX_THEME.surfaceFocused : CODEX_THEME.surface;
+    this.statusColumn.backgroundColor = this.focusArea === "status" ? CODEX_THEME.surfaceFocused : CODEX_THEME.surface;
+    if (this.battlefieldView) {
+      this.battlefieldView.bg = this.focusArea === "display" ? CODEX_THEME.surfaceFocused : CODEX_THEME.surface;
+    }
+    if (this.actionView) {
+      this.actionView.bg = this.focusArea === "action" ? CODEX_THEME.surfaceFocused : CODEX_THEME.surface;
+    }
+    if (this.logsView) {
+      this.logsView.bg = this.focusArea === "status" ? CODEX_THEME.surfaceFocused : CODEX_THEME.surface;
+    }
+    if (this.chatView) {
+      this.chatView.bg = this.focusArea === "status" ? CODEX_THEME.surfaceFocused : CODEX_THEME.surface;
+    }
+    this.displayColumn.title = this.focusArea === "display" ? " › 对局记录 " : " 对局记录 ";
+    this.actionColumn.title = this.focusArea === "action" ? " › 下一步 " : " 下一步 ";
+    this.statusColumn.title = this.focusArea === "status" ? " › 聊天 / 战场 " : " 聊天 / 战场 ";
   }
 
   private toCommandChar(event: KeyEvent): string | null {
-    const value = event.sequence && event.sequence.length === 1 ? event.sequence : event.name;
-    if (!value || value.length !== 1) {
+    if (event.sequence && !/[\u0000-\u001f\u007f]/.test(event.sequence)) {
+      return event.sequence;
+    }
+    if (!event.name || Array.from(event.name).length !== 1 || /[\u0000-\u001f\u007f]/.test(event.name)) {
       return null;
     }
-    if (!/^[ -~]$/.test(value)) {
-      return null;
-    }
-    return value;
+    return event.name;
   }
 }

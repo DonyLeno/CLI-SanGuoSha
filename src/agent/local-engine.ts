@@ -1,5 +1,6 @@
 import { CardType } from "../engine/cards.js";
 import { GameAction, GameSnapshot, PlayerRole, SanGuoGame } from "../engine/game.js";
+import type { InteractionDecision, InteractionRequest } from "../engine/interaction.js";
 import { RoundPromptContext } from "./prompt.js";
 
 type RoleScore = {
@@ -67,12 +68,21 @@ export class LocalAiEngine {
 
   private readonly roleScoreByName: Map<string, RoleScore>;
 
+  private maxContextRounds: number;
+
   constructor(rulesText: string) {
     this.rulesText = rulesText;
     this.memory = [];
     this.processedRounds = new Set();
     this.behaviorByName = new Map();
     this.roleScoreByName = new Map();
+    this.maxContextRounds = 30;
+  }
+
+  setMaxContextRounds(rounds: number): void {
+    if (Number.isInteger(rounds) && rounds > 0) {
+      this.maxContextRounds = rounds;
+    }
   }
 
   reset(): void {
@@ -83,7 +93,7 @@ export class LocalAiEngine {
   }
 
   syncPreviousRounds(contexts: RoundPromptContext[]): void {
-    this.memory = contexts.slice(-3);
+    this.memory = contexts.slice(-this.maxContextRounds);
     for (const round of this.memory) {
       if (this.processedRounds.has(round.round)) {
         continue;
@@ -122,6 +132,33 @@ export class LocalAiEngine {
       }
     }
     return bestDecision;
+  }
+
+  decideInteraction(
+    _game: SanGuoGame,
+    _playerId: string,
+    request: InteractionRequest,
+  ): InteractionDecision | null {
+    if (request.kind === "optional-effect") {
+      return { choice: "effect", enabled: true };
+    }
+    if (request.kind === "choose-card") {
+      const selected = request.sources.reduce<(typeof request.sources)[number] | undefined>((best, source) => {
+        if (!best) return source;
+        return this.interactionCardScore(source.card.type) > this.interactionCardScore(best.card.type) ? source : best;
+      }, undefined);
+      return selected ? { choice: "card", sourceId: selected.sourceId } : { choice: "pass" };
+    }
+    return null;
+  }
+
+  private interactionCardScore(cardType: CardType): number {
+    if (cardType === CardType.Peach) return 100;
+    if (cardType === CardType.ExNihilo) return 90;
+    if (cardType === CardType.Negate) return 80;
+    if (cardType === CardType.Dodge) return 70;
+    if (cardType === CardType.Slash || cardType === CardType.FireSlash) return 60;
+    return 40;
   }
 
   private processRoundContext(round: RoundPromptContext): void {
@@ -306,7 +343,7 @@ export class LocalAiEngine {
       baseScore = self.hp <= 2 ? 12 : self.hp < self.maxHp ? 6 : -2;
     } else if (cardType === CardType.ExNihilo) {
       baseScore = 9;
-    } else if (cardType === CardType.Slash) {
+    } else if (cardType === CardType.Slash || cardType === CardType.FireSlash) {
       baseScore = 8 + (1 - targetEval.cardPrediction.dodge) * 3;
     } else if (cardType === CardType.Duel) {
       baseScore = 7 + (1 - targetEval.cardPrediction.slash) * 2;
@@ -330,7 +367,6 @@ export class LocalAiEngine {
       cardType === CardType.Halberd ||
       cardType === CardType.KylinBow ||
       cardType === CardType.EightDiagram ||
-      cardType === CardType.RenwangShield ||
       cardType === CardType.VineArmor ||
       cardType === CardType.SilverLion ||
       cardType === CardType.Dilu ||
@@ -389,7 +425,7 @@ export class LocalAiEngine {
       let score = ally ? -14 : 8;
       score += (4 - Math.max(target.hp, 0)) * 1.8;
       score += target.hand.length * 0.35;
-      if (cardType === CardType.Slash || cardType === CardType.ArrowRain) {
+      if (cardType === CardType.Slash || cardType === CardType.FireSlash || cardType === CardType.ArrowRain) {
         score += (1 - prediction.dodge) * 3;
       }
       if (cardType === CardType.Duel || cardType === CardType.Barbarian) {

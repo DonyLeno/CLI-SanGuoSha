@@ -1,5 +1,13 @@
 node_modules/
 dist/
 .DS_Store
+.idea/
 .env
 devlog/*.md
+.tokensave
+
+# Build artifacts
+tools/light-client/clisanguo-lite*
+nohup.out
+.serena/
+.zcode/
